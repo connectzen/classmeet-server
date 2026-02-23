@@ -34,6 +34,8 @@ const TEACHER_GRACE_MS = 30_000;
 
 // User ID to Socket ID mapping for direct messaging
 const userSockets = new Map();
+// Dedicated map for chat-specific sockets (set via chat:register only)
+const chatSockets = new Map();
 
 // ── Ensure per-pair chat_permissions table exists ─────────────────────────
 db.query(`
@@ -371,7 +373,7 @@ app.put('/api/chat/allow/:userId', async (req, res) => {
              ON CONFLICT (student_id, target_user_id) DO UPDATE SET status = 'allowed'`,
             [userId, targetUserId]
         );
-        const sockId = userSockets.get(userId);
+        const sockId = chatSockets.get(userId) || userSockets.get(userId);
         if (sockId) io.to(sockId).emit('chat:accessGranted', { by: targetUserId });
         io.emit('admin:refresh', { type: 'chatRequests' });
         res.json({ success: true });
@@ -390,7 +392,7 @@ app.put('/api/chat/revoke/:userId', async (req, res) => {
             `UPDATE chat_permissions SET status = 'none' WHERE student_id = $1 AND target_user_id = $2`,
             [userId, targetUserId]
         );
-        const sockId = userSockets.get(userId);
+        const sockId = chatSockets.get(userId) || userSockets.get(userId);
         if (sockId) io.to(sockId).emit('chat:accessRevoked', { by: targetUserId });
         res.json({ success: true });
     } catch (err) {
@@ -408,7 +410,7 @@ app.put('/api/chat/decline/:userId', async (req, res) => {
             `UPDATE chat_permissions SET status = 'declined' WHERE student_id = $1 AND target_user_id = $2`,
             [userId, targetUserId]
         );
-        const sockId = userSockets.get(userId);
+        const sockId = chatSockets.get(userId) || userSockets.get(userId);
         if (sockId) io.to(sockId).emit('chat:accessDeclined', { by: targetUserId });
         io.emit('admin:refresh', { type: 'chatRequests' });
         res.json({ success: true });
@@ -1171,7 +1173,10 @@ io.on('connection', (socket) => {
 
     // ── Chat: Register user socket (extend existing register-user) ─────────
     socket.on('chat:register', (userId) => {
-        if (userId) userSockets.set(userId, socket.id);
+        if (userId) {
+            chatSockets.set(userId, socket.id);
+            userSockets.set(userId, socket.id);
+        }
     });
 
     // ── Chat: Delete message — broadcast to conversation room ──────────────
@@ -1185,6 +1190,13 @@ io.on('connection', (socket) => {
         for (const [userId, sId] of userSockets.entries()) {
             if (sId === socket.id) {
                 userSockets.delete(userId);
+                break;
+            }
+        }
+        // Remove from chatSockets if registered
+        for (const [userId, sId] of chatSockets.entries()) {
+            if (sId === socket.id) {
+                chatSockets.delete(userId);
                 break;
             }
         }
