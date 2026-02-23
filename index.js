@@ -301,7 +301,11 @@ app.post('/api/chat/request-access', async (req, res) => {
         await db.query(
             `INSERT INTO chat_permissions (student_id, target_user_id, student_name, student_email, status)
              VALUES ($1, $2, $3, $4, 'pending')
-             ON CONFLICT (student_id, target_user_id) DO UPDATE SET status = 'pending', student_name = $3, student_email = $4, created_at = NOW()`,
+             ON CONFLICT (student_id, target_user_id) DO UPDATE
+               SET status        = CASE WHEN chat_permissions.status = 'allowed' THEN 'allowed' ELSE 'pending' END,
+                   student_name  = EXCLUDED.student_name,
+                   student_email = EXCLUDED.student_email,
+                   created_at    = CASE WHEN chat_permissions.status = 'allowed' THEN chat_permissions.created_at ELSE NOW() END`,
             [userId, targetUserId, userName || '', email || '']
         );
         io.emit('admin:refresh', { type: 'chatRequests' });

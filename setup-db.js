@@ -45,7 +45,55 @@ async function setupDatabase() {
             is_read     BOOLEAN DEFAULT FALSE,
             created_at  TIMESTAMPTZ DEFAULT NOW()
         )`,
-        `CREATE INDEX IF NOT EXISTS idx_messages_receiver_id ON messages(receiver_id)`
+        `CREATE INDEX IF NOT EXISTS idx_messages_receiver_id ON messages(receiver_id)`,
+
+        // ── Chat System ───────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS chat_conversations (
+            id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            type       TEXT NOT NULL DEFAULT 'dm' CHECK (type IN ('dm','group','broadcast')),
+            name       TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE TABLE IF NOT EXISTS chat_participants (
+            conversation_id UUID NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            user_id         TEXT NOT NULL,
+            user_name       TEXT NOT NULL DEFAULT '',
+            user_role       TEXT NOT NULL DEFAULT 'student',
+            joined_at       TIMESTAMPTZ DEFAULT NOW(),
+            last_read_at    TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (conversation_id, user_id)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_chat_participants_user_id ON chat_participants(user_id)`,
+        `CREATE TABLE IF NOT EXISTS chat_messages (
+            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            conversation_id UUID NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            sender_id       TEXT NOT NULL,
+            sender_name     TEXT NOT NULL DEFAULT '',
+            sender_role     TEXT NOT NULL DEFAULT 'student',
+            content         TEXT,
+            media_url       TEXT,
+            media_type      TEXT CHECK (media_type IN ('image','file','voice') OR media_type IS NULL),
+            media_name      TEXT,
+            reactions       JSONB NOT NULL DEFAULT '{}',
+            is_read         BOOLEAN NOT NULL DEFAULT FALSE,
+            is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at      TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id)`,
+
+        // ── Per-pair chat permissions ─────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS chat_permissions (
+            student_id     TEXT NOT NULL,
+            target_user_id TEXT NOT NULL,
+            student_name   TEXT NOT NULL DEFAULT '',
+            student_email  TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'pending'
+                               CHECK (status IN ('pending','allowed','declined','none')),
+            created_at     TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (student_id, target_user_id)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_chat_permissions_target ON chat_permissions(target_user_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_chat_permissions_student ON chat_permissions(student_id)`
     ];
 
     for (const sql of statements) {
