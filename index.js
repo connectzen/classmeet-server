@@ -195,11 +195,12 @@ app.get('/api/students', async (req, res) => {
     try {
         const { rows } = await db.query(`
             SELECT ur.user_id, ur.name, ur.email, ur.created_at,
-                   COUNT(se.id)::int AS enrollment_count
+                   COUNT(se.id)::int AS enrollment_count,
+                   COALESCE(ur.chat_allowed, false) AS chat_allowed
             FROM user_roles ur
             LEFT JOIN student_enrollments se ON se.user_id = ur.user_id::text
             WHERE ur.role = 'student'
-            GROUP BY ur.user_id, ur.name, ur.email, ur.created_at
+            GROUP BY ur.user_id, ur.name, ur.email, ur.created_at, ur.chat_allowed
             ORDER BY ur.created_at DESC
         `);
         res.json(rows);
@@ -269,6 +270,90 @@ app.delete('/api/students/:id', async (req, res) => {
             }
         }
         io.emit('admin:refresh', { type: 'students' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Chat Access Requests ─────────────────────────────────────────────────
+
+// Student requests access to chat
+app.post('/api/chat/request-access', async (req, res) => {
+    const { userId, userName, email } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    try {
+        await db.query(
+            `INSERT INTO chat_requests (student_id, student_name, student_email, status)
+             VALUES ($1, $2, $3, 'pending')
+             ON CONFLICT (student_id) DO UPDATE SET status = 'pending', created_at = NOW()`,
+            [userId, userName || '', email || '']
+        );
+        io.emit('admin:refresh', { type: 'chatRequests' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get all pending chat requests
+app.get('/api/chat/requests', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT student_id, student_name, student_email, status, created_at
+             FROM chat_requests WHERE status = 'pending' ORDER BY created_at ASC`
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Check a student's chat access
+app.get('/api/chat/access/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT COALESCE(chat_allowed, false) AS chat_allowed FROM user_roles WHERE user_id = $1`,
+            [userId]
+        );
+        const chatAllowed = rows.length > 0 ? rows[0].chat_allowed : false;
+        // Also fetch request status
+        const { rows: reqRows } = await db.query(
+            `SELECT status FROM chat_requests WHERE student_id = $1`,
+            [userId]
+        );
+        const requestStatus = reqRows.length > 0 ? reqRows[0].status : 'none';
+        res.json({ chatAllowed, requestStatus });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Allow a student to chat
+app.put('/api/chat/allow/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        await db.query(`UPDATE user_roles SET chat_allowed = true WHERE user_id = $1`, [userId]);
+        await db.query(`DELETE FROM chat_requests WHERE student_id = $1`, [userId]);
+        // Notify the student directly if online
+        const sockId = userSockets.get(userId);
+        if (sockId) io.to(sockId).emit('chat:accessGranted');
+        io.emit('admin:refresh', { type: 'chatRequests' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Revoke a student's chat access
+app.put('/api/chat/revoke/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        await db.query(`UPDATE user_roles SET chat_allowed = false WHERE user_id = $1`, [userId]);
+        // Notify the student directly if online
+        const sockId = userSockets.get(userId);
+        if (sockId) io.to(sockId).emit('chat:accessRevoked');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1087,12 +1172,33 @@ io.on('connection', (socket) => {
 });
 
 server.listen(PORT, async () => {
-    // Auto-migrate: add is_deleted column if not already present
+    // Auto-migrations
     try {
         await db.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE`);
         console.log('[migrate] chat_messages.is_deleted ready');
     } catch (err) {
-        console.warn('[migrate] is_deleted column check failed:', err.message);
+        console.warn('[migrate] is_deleted column:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS chat_allowed BOOLEAN DEFAULT FALSE`);
+        console.log('[migrate] user_roles.chat_allowed ready');
+    } catch (err) {
+        console.warn('[migrate] chat_allowed column:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS chat_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                student_id TEXT NOT NULL UNIQUE,
+                student_name TEXT,
+                student_email TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        console.log('[migrate] chat_requests table ready');
+    } catch (err) {
+        console.warn('[migrate] chat_requests table:', err.message);
     }
     console.log(`🚀 ClassMeet server running on port ${PORT}`);
     console.log(`   InsForge: ${process.env.INSFORGE_BASE_URL}`);
