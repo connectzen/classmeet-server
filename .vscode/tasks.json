@@ -1,0 +1,29 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Server",
+			"type": "shell",
+			"command": "node index.js",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start ClassMeet Server",
+			"type": "shell",
+			"command": "node index.js",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start Backend Server",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"index.js"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}
