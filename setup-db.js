@@ -79,21 +79,7 @@ async function setupDatabase() {
             is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
             created_at      TIMESTAMPTZ DEFAULT NOW()
         )`,
-        `CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id)`,
-
-        // ── Per-pair chat permissions ─────────────────────────────────────
-        `CREATE TABLE IF NOT EXISTS chat_permissions (
-            student_id     TEXT NOT NULL,
-            target_user_id TEXT NOT NULL,
-            student_name   TEXT NOT NULL DEFAULT '',
-            student_email  TEXT NOT NULL DEFAULT '',
-            status         TEXT NOT NULL DEFAULT 'pending'
-                               CHECK (status IN ('pending','allowed','declined','none')),
-            created_at     TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (student_id, target_user_id)
-        )`,
-        `CREATE INDEX IF NOT EXISTS idx_chat_permissions_target ON chat_permissions(target_user_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_chat_permissions_student ON chat_permissions(student_id)`
+        `CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id)`
     ];
 
     for (const sql of statements) {

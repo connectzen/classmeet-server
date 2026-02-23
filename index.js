@@ -34,21 +34,6 @@ const TEACHER_GRACE_MS = 30_000;
 
 // User ID to Socket ID mapping for direct messaging
 const userSockets = new Map();
-// Dedicated map for chat-specific sockets (set via chat:register only)
-const chatSockets = new Map();
-
-// ── Ensure per-pair chat_permissions table exists ─────────────────────────
-db.query(`
-    CREATE TABLE IF NOT EXISTS chat_permissions (
-        student_id     TEXT NOT NULL,
-        target_user_id TEXT NOT NULL,
-        student_name   TEXT DEFAULT '',
-        student_email  TEXT DEFAULT '',
-        status         TEXT NOT NULL DEFAULT 'pending',
-        created_at     TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (student_id, target_user_id)
-    )
-`).catch(err => console.error('[init] chat_permissions table error:', err.message));
 
 // ── Cascade-delete all content produced by a user (called before Auth deletion) ──
 async function cascadeDeleteUserContent(userId) {
@@ -285,138 +270,6 @@ app.delete('/api/students/:id', async (req, res) => {
             }
         }
         io.emit('admin:refresh', { type: 'students' });
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ── Chat Access Requests ─────────────────────────────────────────────────
-
-// Student requests access to chat with a specific teacher/admin
-app.post('/api/chat/request-access', async (req, res) => {
-    const { userId, userName, email, targetUserId } = req.body;
-    if (!userId || !targetUserId) return res.status(400).json({ error: 'userId and targetUserId required' });
-    try {
-        await db.query(
-            `INSERT INTO chat_permissions (student_id, target_user_id, student_name, student_email, status)
-             VALUES ($1, $2, $3, $4, 'pending')
-             ON CONFLICT (student_id, target_user_id) DO UPDATE
-               SET status        = CASE WHEN chat_permissions.status = 'allowed' THEN 'allowed' ELSE 'pending' END,
-                   student_name  = EXCLUDED.student_name,
-                   student_email = EXCLUDED.student_email,
-                   created_at    = CASE WHEN chat_permissions.status = 'allowed' THEN chat_permissions.created_at ELSE NOW() END`,
-            [userId, targetUserId, userName || '', email || '']
-        );
-        io.emit('admin:refresh', { type: 'chatRequests' });
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Get pending chat requests; optionally filter by targetUserId (teacher/admin passes their own ID)
-app.get('/api/chat/requests', async (req, res) => {
-    const { targetUserId } = req.query;
-    try {
-        const { rows } = await db.query(
-            targetUserId
-                ? `SELECT student_id, student_name, student_email, status, created_at, target_user_id FROM chat_permissions WHERE status = 'pending' AND target_user_id = $1 ORDER BY created_at ASC`
-                : `SELECT student_id, student_name, student_email, status, created_at, target_user_id FROM chat_permissions WHERE status = 'pending' ORDER BY created_at ASC`,
-            targetUserId ? [targetUserId] : []
-        );
-        res.json(rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Get all per-pair permissions for a student
-app.get('/api/chat/permissions/:userId', async (req, res) => {
-    const { userId } = req.params;
-    try {
-        const { rows } = await db.query(
-            `SELECT target_user_id, status FROM chat_permissions WHERE student_id = $1`,
-            [userId]
-        );
-        res.json(rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Check a student's chat access
-app.get('/api/chat/access/:userId', async (req, res) => {
-    const { userId } = req.params;
-    try {
-        const { rows } = await db.query(
-            `SELECT COALESCE(chat_allowed, false) AS chat_allowed FROM user_roles WHERE user_id = $1`,
-            [userId]
-        );
-        const chatAllowed = rows.length > 0 ? rows[0].chat_allowed : false;
-        // Also fetch request status from new table
-        const { rows: reqRows } = await db.query(
-            `SELECT target_user_id, status FROM chat_permissions WHERE student_id = $1`,
-            [userId]
-        );
-        res.json({ chatAllowed, permissions: reqRows });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Allow a student to chat (per-pair)
-app.put('/api/chat/allow/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const { targetUserId } = req.body;
-    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required' });
-    try {
-        await db.query(
-            `INSERT INTO chat_permissions (student_id, target_user_id, status)
-             VALUES ($1, $2, 'allowed')
-             ON CONFLICT (student_id, target_user_id) DO UPDATE SET status = 'allowed'`,
-            [userId, targetUserId]
-        );
-        const sockId = chatSockets.get(userId) || userSockets.get(userId);
-        if (sockId) io.to(sockId).emit('chat:accessGranted', { by: targetUserId });
-        io.emit('admin:refresh', { type: 'chatRequests' });
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Revoke a student's chat access (per-pair — end chat)
-app.put('/api/chat/revoke/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const { targetUserId } = req.body;
-    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required' });
-    try {
-        await db.query(
-            `UPDATE chat_permissions SET status = 'none' WHERE student_id = $1 AND target_user_id = $2`,
-            [userId, targetUserId]
-        );
-        const sockId = chatSockets.get(userId) || userSockets.get(userId);
-        if (sockId) io.to(sockId).emit('chat:accessRevoked', { by: targetUserId });
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Decline a student's chat request (per-pair)
-app.put('/api/chat/decline/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const { targetUserId } = req.body;
-    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required' });
-    try {
-        await db.query(
-            `UPDATE chat_permissions SET status = 'declined' WHERE student_id = $1 AND target_user_id = $2`,
-            [userId, targetUserId]
-        );
-        const sockId = chatSockets.get(userId) || userSockets.get(userId);
-        if (sockId) io.to(sockId).emit('chat:accessDeclined', { by: targetUserId });
-        io.emit('admin:refresh', { type: 'chatRequests' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1175,14 +1028,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ── Chat: Register user socket (extend existing register-user) ─────────
-    socket.on('chat:register', (userId) => {
-        if (userId) {
-            chatSockets.set(userId, socket.id);
-            userSockets.set(userId, socket.id);
-        }
-    });
-
     // ── Chat: Delete message — broadcast to conversation room ──────────────
     socket.on('chat:delete', ({ messageId, conversationId }) => {
         io.to(`chat:${conversationId}`).emit('chat:deleted', { messageId, conversationId });
@@ -1197,14 +1042,6 @@ io.on('connection', (socket) => {
                 break;
             }
         }
-        // Remove from chatSockets if registered
-        for (const [userId, sId] of chatSockets.entries()) {
-            if (sId === socket.id) {
-                chatSockets.delete(userId);
-                break;
-            }
-        }
-
         const roomCode = roomManager.getParticipantRoom(socket.id);
         if (!roomCode) return;
 
