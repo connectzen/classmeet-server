@@ -350,7 +350,7 @@ app.post('/api/approve-user/:userId', async (req, res) => {
         await db.query(
             `INSERT INTO user_roles (user_id, role, name, email)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role`,
+             ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name`,
             [userId, role, name || '', email || '']
         );
         io.emit('admin:refresh', { type: 'pending' });
@@ -370,7 +370,7 @@ app.patch('/api/profile/sync-name', async (req, res) => {
             `UPDATE user_roles SET name = $1 WHERE user_id = $2`,
             [name.trim(), userId]
         );
-        // Emit refresh so admin dashboards show updated name immediately
+        // Emit refresh so dashboards show updated name immediately
         io.emit('admin:refresh', { type: 'students' });
         io.emit('admin:refresh', { type: 'teachers' });
         res.json({ success: true, updated: rowCount > 0 });
