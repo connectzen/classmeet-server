@@ -83,16 +83,35 @@ async function cascadeDeleteUserContent(userId) {
 const ADMIN_USER_IDS = new Set(
     (process.env.ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean)
 );
+const ADMIN_EMAILS = new Set(
+    (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean)
+);
+
+async function isAdminUser(userId, email) {
+    if (ADMIN_USER_IDS.has(userId)) return true;
+    if (ADMIN_EMAILS.size === 0) return false;
+    // Check directly supplied email (passed from client auth session)
+    if (email && ADMIN_EMAILS.has(email.toLowerCase())) return true;
+    try {
+        // Fallback: look up email from user_roles table
+        const { rows } = await db.query('SELECT email FROM user_roles WHERE user_id = $1', [userId]);
+        if (rows.length > 0 && rows[0].email && ADMIN_EMAILS.has(rows[0].email.toLowerCase())) {
+            return true;
+        }
+    } catch { /* fall through */ }
+    return false;
+}
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.get('/api/is-admin/:userId', (req, res) => {
-    res.json({ isAdmin: ADMIN_USER_IDS.has(req.params.userId) });
+app.get('/api/is-admin/:userId', async (req, res) => {
+    res.json({ isAdmin: await isAdminUser(req.params.userId, req.query.email) });
 });
 
 app.get('/api/user-role/:userId', async (req, res) => {
     const { userId } = req.params;
-    if (ADMIN_USER_IDS.has(userId)) {
+    const { email } = req.query;
+    if (await isAdminUser(userId, email)) {
         return res.json({ role: 'admin' });
     }
     try {
