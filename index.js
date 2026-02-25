@@ -360,6 +360,27 @@ app.post('/api/approve-user/:userId', async (req, res) => {
     }
 });
 
+// ── Sync profile name from InsForge to user_roles ────────────────────────
+// Called by the client after insforge.auth.setProfile() succeeds
+app.patch('/api/profile/sync-name', async (req, res) => {
+    const { userId, name } = req.body;
+    if (!userId || !name) return res.status(400).json({ error: 'userId and name are required' });
+    try {
+        const { rowCount } = await db.query(
+            `UPDATE user_roles SET name = $1 WHERE user_id = $2`,
+            [name.trim(), userId]
+        );
+        // Also sync chat_messages sender_name for future messages (existing messages keep historical name)
+        // Emit refresh so admin dashboards show updated name immediately
+        io.emit('admin:refresh', { type: 'students' });
+        io.emit('admin:refresh', { type: 'teachers' });
+        res.json({ success: true, updated: rowCount > 0 });
+    } catch (err) {
+        console.error('[profile/sync-name]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/messages/:userId', async (req, res) => {
     const { userId } = req.params;
     try {
@@ -1404,6 +1425,12 @@ server.listen(PORT, async () => {
         console.log('[migrate] user_roles.chat_allowed ready');
     } catch (err) {
         console.warn('[migrate] chat_allowed column:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE teacher_sessions ADD COLUMN IF NOT EXISTS session_image_url TEXT`);
+        console.log('[migrate] teacher_sessions.session_image_url ready');
+    } catch (err) {
+        console.warn('[migrate] session_image_url column:', err.message);
     }
     try {
         await db.query(`
