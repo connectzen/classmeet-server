@@ -1200,6 +1200,20 @@ app.get('/api/teacher/sessions/for-student/:userId', async (req, res) => {
     }
 });
 
+// Get targets for a session
+app.get('/api/teacher/sessions/:sessionId/targets', async (req, res) => {
+    const { sessionId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT target_user_id FROM teacher_session_targets WHERE session_id = $1`,
+            [sessionId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Delete a teacher session (teacher/owner only)
 app.delete('/api/teacher/sessions/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
@@ -1218,6 +1232,42 @@ app.delete('/api/teacher/sessions/:sessionId', async (req, res) => {
         }
 
         io.emit('teacher:session-ended', { sessionId });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update a teacher session (teacher/owner only)
+app.put('/api/teacher/sessions/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    const { teacherId, title, description, scheduledAt, targetStudentIds } = req.body;
+    if (!teacherId || !title || !scheduledAt) return res.status(400).json({ error: 'Missing required fields' });
+    try {
+        // Verify ownership
+        const { rows } = await db.query('SELECT * FROM teacher_sessions WHERE id = $1', [sessionId]);
+        if (!rows.length) return res.status(404).json({ error: 'Session not found' });
+        const session = rows[0];
+        if (session.created_by !== teacherId) return res.status(403).json({ error: 'Not authorized' });
+
+        // Update session
+        await db.query(
+            `UPDATE teacher_sessions SET title=$1, description=$2, scheduled_at=$3 WHERE id=$4`,
+            [title, description || '', new Date(scheduledAt).toISOString(), sessionId]
+        );
+
+        // Update targets
+        if (Array.isArray(targetStudentIds)) {
+            await db.query('DELETE FROM teacher_session_targets WHERE session_id = $1', [sessionId]);
+            for (const studentId of targetStudentIds) {
+                await db.query(
+                    `INSERT INTO teacher_session_targets (session_id, target_user_id) VALUES ($1, $2)`,
+                    [sessionId, studentId]
+                );
+            }
+        }
+
+        io.emit('teacher:session-updated', { sessionId });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
