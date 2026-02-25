@@ -925,11 +925,72 @@ app.put('/api/admin/meetings/:meetingId', async (req, res) => {
     }
 });
 
+// ─── TEACHER SESSION IMAGE UPLOAD ─────────────────────────────────────────
+
+// Upload session image to InsForge Storage
+app.post('/api/teacher/upload-session-image', upload.single('file'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    try {
+        const baseUrl = process.env.INSFORGE_BASE_URL;
+        const apiKey  = process.env.INSFORGE_API_KEY;
+        const ext     = req.file.originalname.split('.').pop() || 'bin';
+        const filename = `session-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+        // Step 1 — get upload strategy
+        const stratRes = await fetch(`${baseUrl}/api/storage/buckets/avatars/upload-strategy`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, contentType: req.file.mimetype, size: req.file.size }),
+        });
+        if (!stratRes.ok) return res.status(500).json({ error: 'Strategy failed: ' + await stratRes.text() });
+        const strategy = await stratRes.json();
+
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        let publicUrl;
+
+        if (strategy.method === 'direct') {
+            // Local storage — PUT multipart
+            const uploadUrl = strategy.uploadUrl.startsWith('http') ? strategy.uploadUrl : `${baseUrl}${strategy.uploadUrl}`;
+            const form = new FormData();
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(uploadUrl, {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                body: form,
+            });
+            if (!upRes.ok) return res.status(500).json({ error: 'Upload failed: ' + await upRes.text() });
+            publicUrl = uploadUrl;
+        } else {
+            // S3 — POST to presigned URL with all fields
+            const form = new FormData();
+            for (const [k, v] of Object.entries(strategy.fields || {})) form.append(k, String(v));
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(strategy.uploadUrl, { method: 'POST', body: form });
+            if (!upRes.ok) return res.status(500).json({ error: 'S3 upload failed: ' + await upRes.text() });
+            // Confirm if required
+            if (strategy.confirmRequired && strategy.confirmUrl) {
+                const confirmUrl = strategy.confirmUrl.startsWith('http') ? strategy.confirmUrl : `${baseUrl}${strategy.confirmUrl}`;
+                await fetch(confirmUrl, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ size: req.file.size, contentType: req.file.mimetype }),
+                });
+            }
+            publicUrl = `${baseUrl}/api/storage/buckets/avatars/objects/${strategy.key}`;
+        }
+
+        res.json({ url: publicUrl, name: req.file.originalname, type: req.file.mimetype, key: strategy.key });
+    } catch (err) {
+        console.error('[teacher/upload-session-image]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── TEACHER SESSIONS ──────────────────────────────────────────────────────
 
 // Create a teacher session (teacher only)
 app.post('/api/teacher/sessions', async (req, res) => {
-    const { title, description, scheduledAt, maxParticipants = 30, targetStudentIds, createdBy } = req.body;
+    const { title, description, scheduledAt, maxParticipants = 30, targetStudentIds, createdBy, sessionImageUrl } = req.body;
     if (!title || !scheduledAt || !createdBy) return res.status(400).json({ error: 'Missing required fields' });
     // Verify teacher role
     try {
@@ -954,9 +1015,9 @@ app.post('/api/teacher/sessions', async (req, res) => {
 
         // Insert teacher_session record
         await db.query(
-            `INSERT INTO teacher_sessions (id, room_code, room_id, title, description, scheduled_at, created_by, max_participants)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [sessionId, code, roomId, title, description || '', scheduledAt, createdBy, Number(maxParticipants)]
+            `INSERT INTO teacher_sessions (id, room_code, room_id, title, description, scheduled_at, created_by, max_participants, session_image_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [sessionId, code, roomId, title, description || '', scheduledAt, createdBy, Number(maxParticipants), sessionImageUrl || null]
         );
 
         // Insert target rows
@@ -1051,7 +1112,7 @@ app.delete('/api/teacher/sessions/:sessionId', async (req, res) => {
 // Update a teacher session (teacher/owner only)
 app.put('/api/teacher/sessions/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
-    const { teacherId, title, description, scheduledAt, targetStudentIds } = req.body;
+    const { teacherId, title, description, scheduledAt, targetStudentIds, sessionImageUrl } = req.body;
     if (!teacherId || !title || !scheduledAt) return res.status(400).json({ error: 'Missing required fields' });
     try {
         // Verify ownership
@@ -1062,8 +1123,8 @@ app.put('/api/teacher/sessions/:sessionId', async (req, res) => {
 
         // Update session
         await db.query(
-            `UPDATE teacher_sessions SET title=$1, description=$2, scheduled_at=$3 WHERE id=$4`,
-            [title, description || '', new Date(scheduledAt).toISOString(), sessionId]
+            `UPDATE teacher_sessions SET title=$1, description=$2, scheduled_at=$3, session_image_url=$4 WHERE id=$5`,
+            [title, description || '', new Date(scheduledAt).toISOString(), sessionImageUrl || null, sessionId]
         );
 
         // Update targets
@@ -1398,6 +1459,7 @@ server.listen(PORT, async () => {
                 created_by TEXT NOT NULL,
                 max_participants INTEGER DEFAULT 30,
                 is_active BOOLEAN NOT NULL DEFAULT true,
+                session_image_url TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         `);
