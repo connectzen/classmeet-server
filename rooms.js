@@ -9,7 +9,13 @@ class RoomManager {
         this.teacherMap = new Map();
         // Map<roomCode, socketId> - tracks current spotlight per room
         this.spotlightMap = new Map();
+        // Map<roomCode, number> - tracks max participants per room
+        this.maxParticipantsMap = new Map();
     }
+
+    setMaxParticipants(code, max) { this.maxParticipantsMap.set(code, max); }
+    getMaxParticipants(code) { return this.maxParticipantsMap.get(code) || 5; }
+
 
     getRoomByCode(code) { return this.rooms.get(code); }
 

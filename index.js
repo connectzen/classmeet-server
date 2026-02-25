@@ -854,7 +854,304 @@ app.post('/api/rooms', async (req, res) => {
     res.json(data[0]);
 });
 
+// ─── ADMIN MEETINGS ──────────────────────────────────────────────────────
+
+// List all rooms (admin use — for meeting target picker)
+app.get('/api/admin/all-rooms', async (req, res) => {
+    const { data, error } = await insforge.database
+        .from('rooms')
+        .select('id, code, name, host_id')
+        .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+});
+
+// Create an admin meeting (admin only)
+app.post('/api/admin/meetings', async (req, res) => {
+    const { title, description, scheduledAt, maxParticipants = 30, targets, createdBy } = req.body;
+    if (!title || !scheduledAt || !targets || !createdBy) return res.status(400).json({ error: 'Missing required fields' });
+    if (!ADMIN_USER_IDS.has(createdBy)) return res.status(403).json({ error: 'Admin only' });
+    try {
+        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const meetingId = require('crypto').randomUUID();
+
+        // Create the room in InsForge DB with the specified max_participants
+        const { data: roomData, error: roomError } = await insforge.database
+            .from('rooms')
+            .insert([{ code, name: title, host_id: createdBy, max_participants: Number(maxParticipants) }])
+            .select();
+        if (roomError || !roomData?.[0]) return res.status(500).json({ error: roomError?.message || 'Failed to create room' });
+        const roomId = roomData[0].id;
+
+        // Insert admin_meeting record
+        await db.query(
+            `INSERT INTO admin_meetings (id, room_code, room_id, title, description, scheduled_at, created_by, max_participants)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [meetingId, code, roomId, title, description || '', scheduledAt, createdBy, Number(maxParticipants)]
+        );
+
+        // Insert target rows
+        for (const target of targets) {
+            await db.query(
+                `INSERT INTO admin_meeting_targets (meeting_id, target_type, target_value) VALUES ($1, $2, $3)`,
+                [meetingId, target.type, target.value]
+            );
+        }
+
+        // Cache max_participants so first joiner doesn't need a DB lookup
+        roomManager.setMaxParticipants(code, Number(maxParticipants));
+
+        // Notify all connected clients
+        io.emit('admin:meeting-created', { meetingId });
+
+        res.json({ id: meetingId, code, roomId, title });
+    } catch (err) {
+        console.error('[admin/meetings POST]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// List all admin meetings (for admin dashboard)
+app.get('/api/admin/meetings', async (req, res) => {
+    try {
+        const { rows } = await db.query(`
+            SELECT am.*,
+                   COALESCE(json_agg(json_build_object('type', amt.target_type, 'value', amt.target_value) ORDER BY amt.id)
+                            FILTER (WHERE amt.target_type IS NOT NULL), '[]') AS targets
+            FROM admin_meetings am
+            LEFT JOIN admin_meeting_targets amt ON amt.meeting_id = am.id
+            GROUP BY am.id
+            ORDER BY am.scheduled_at ASC
+        `);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get meetings targeted at a specific user (for Landing banner)
+app.get('/api/admin/meetings/for-user/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        // Resolve user role
+        let userRole = 'pending';
+        if (ADMIN_USER_IDS.has(userId)) {
+            userRole = 'admin';
+        } else {
+            const { rows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [userId]);
+            if (rows.length > 0) userRole = rows[0].role;
+        }
+
+        // Get user's enrolled room IDs
+        const { rows: enrollments } = await db.query(
+            'SELECT room_id FROM student_enrollments WHERE user_id = $1', [userId]
+        );
+        const enrolledRoomIds = enrollments.map(e => e.room_id);
+
+        // Find active meetings with at least one matching target
+        let queryText;
+        let queryParams;
+        if (enrolledRoomIds.length > 0) {
+            queryText = `
+                SELECT DISTINCT am.*
+                FROM admin_meetings am
+                JOIN admin_meeting_targets amt ON amt.meeting_id = am.id
+                WHERE am.is_active = true
+                AND (
+                    (amt.target_type = 'role' AND amt.target_value = $1)
+                    OR (amt.target_type = 'user' AND amt.target_value = $2)
+                    OR (amt.target_type = 'room' AND amt.target_value = ANY($3::text[]))
+                )
+                ORDER BY am.scheduled_at ASC
+            `;
+            queryParams = [userRole, userId, enrolledRoomIds];
+        } else {
+            queryText = `
+                SELECT DISTINCT am.*
+                FROM admin_meetings am
+                JOIN admin_meeting_targets amt ON amt.meeting_id = am.id
+                WHERE am.is_active = true
+                AND (
+                    (amt.target_type = 'role' AND amt.target_value = $1)
+                    OR (amt.target_type = 'user' AND amt.target_value = $2)
+                )
+                ORDER BY am.scheduled_at ASC
+            `;
+            queryParams = [userRole, userId];
+        }
+
+        const { rows: meetings } = await db.query(queryText, queryParams);
+        res.json(meetings);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete an admin meeting (hard delete from DB + end room)
+app.delete('/api/admin/meetings/:meetingId', async (req, res) => {
+    const { meetingId } = req.params;
+    const { adminId } = req.body;
+    if (!adminId || !ADMIN_USER_IDS.has(adminId)) return res.status(403).json({ error: 'Admin only' });
+    try {
+        const { rows } = await db.query('SELECT * FROM admin_meetings WHERE id = $1', [meetingId]);
+        if (!rows.length) return res.status(404).json({ error: 'Meeting not found' });
+        const meeting = rows[0];
+
+        // Hard delete — cascade removes targets too
+        await db.query('DELETE FROM admin_meetings WHERE id = $1', [meetingId]);
+
+        // Close the room if the meeting was still active
+        if (meeting.is_active) {
+            try { await endRoom(meeting.room_code, meeting.room_id); } catch (e) { /* ignore if already gone */ }
+        }
+
+        // Notify all clients
+        io.emit('admin:meeting-ended', { meetingId });
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Edit an admin meeting (update fields + replace targets)
+app.put('/api/admin/meetings/:meetingId', async (req, res) => {
+    const { meetingId } = req.params;
+    const { adminId, title, description, scheduledAt, maxParticipants, targets } = req.body;
+    if (!adminId || !ADMIN_USER_IDS.has(adminId)) return res.status(403).json({ error: 'Admin only' });
+    if (!title || !scheduledAt) return res.status(400).json({ error: 'Title and scheduledAt are required' });
+    try {
+        await db.query(
+            `UPDATE admin_meetings SET title=$1, description=$2, scheduled_at=$3, max_participants=$4 WHERE id=$5`,
+            [title, description || '', new Date(scheduledAt).toISOString(), Number(maxParticipants) || 30, meetingId]
+        );
+        if (Array.isArray(targets)) {
+            await db.query('DELETE FROM admin_meeting_targets WHERE meeting_id = $1', [meetingId]);
+            for (const t of targets) {
+                await db.query(
+                    `INSERT INTO admin_meeting_targets (meeting_id, target_type, target_value) VALUES ($1, $2, $3)`,
+                    [meetingId, t.type, t.value]
+                );
+            }
+        }
+        io.emit('admin:meeting-updated', { meetingId });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── TEACHER SESSIONS ──────────────────────────────────────────────────────
+
+// Create a teacher session (teacher only)
+app.post('/api/teacher/sessions', async (req, res) => {
+    const { title, description, scheduledAt, maxParticipants = 30, targetStudentIds, createdBy } = req.body;
+    if (!title || !scheduledAt || !createdBy) return res.status(400).json({ error: 'Missing required fields' });
+    // Verify teacher role
+    try {
+        const { rows: roleRows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [createdBy]);
+        if (!roleRows.length || (roleRows[0].role !== 'teacher')) {
+            return res.status(403).json({ error: 'Teacher only' });
+        }
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+    try {
+        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const sessionId = require('crypto').randomUUID();
+
+        // Create the room in InsForge DB
+        const { data: roomData, error: roomError } = await insforge.database
+            .from('rooms')
+            .insert([{ code, name: title, host_id: createdBy, max_participants: Number(maxParticipants) }])
+            .select();
+        if (roomError || !roomData?.[0]) return res.status(500).json({ error: roomError?.message || 'Failed to create room' });
+        const roomId = roomData[0].id;
+
+        // Insert teacher_session record
+        await db.query(
+            `INSERT INTO teacher_sessions (id, room_code, room_id, title, description, scheduled_at, created_by, max_participants)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [sessionId, code, roomId, title, description || '', scheduledAt, createdBy, Number(maxParticipants)]
+        );
+
+        // Insert target rows
+        if (Array.isArray(targetStudentIds)) {
+            for (const studentId of targetStudentIds) {
+                await db.query(
+                    `INSERT INTO teacher_session_targets (session_id, target_user_id) VALUES ($1, $2)`,
+                    [sessionId, studentId]
+                );
+            }
+        }
+
+        roomManager.setMaxParticipants(code, Number(maxParticipants));
+        io.emit('teacher:session-created', { sessionId });
+        res.json({ id: sessionId, code, roomId, title });
+    } catch (err) {
+        console.error('[teacher/sessions POST]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get teacher's own sessions
+app.get('/api/teacher/sessions/by-host/:teacherId', async (req, res) => {
+    const { teacherId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT * FROM teacher_sessions WHERE created_by = $1 ORDER BY scheduled_at ASC`,
+            [teacherId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get sessions targeted at a specific student
+app.get('/api/teacher/sessions/for-student/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT DISTINCT ts.*
+             FROM teacher_sessions ts
+             JOIN teacher_session_targets tst ON tst.session_id = ts.id
+             WHERE ts.is_active = true AND tst.target_user_id = $1
+             ORDER BY ts.scheduled_at ASC`,
+            [userId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete a teacher session (teacher/owner only)
+app.delete('/api/teacher/sessions/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    const { teacherId } = req.body;
+    if (!teacherId) return res.status(400).json({ error: 'teacherId required' });
+    try {
+        const { rows } = await db.query('SELECT * FROM teacher_sessions WHERE id = $1', [sessionId]);
+        if (!rows.length) return res.status(404).json({ error: 'Session not found' });
+        const session = rows[0];
+        if (session.created_by !== teacherId) return res.status(403).json({ error: 'Not authorized' });
+
+        await db.query('DELETE FROM teacher_sessions WHERE id = $1', [sessionId]);
+
+        if (session.is_active) {
+            try { await endRoom(session.room_code, session.room_id); } catch (e) { /* ignore */ }
+        }
+
+        io.emit('teacher:session-ended', { sessionId });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────
+
 
 async function endRoom(roomCode, roomId) {
     try {
@@ -886,54 +1183,72 @@ io.on('connection', (socket) => {
     });
 
     // ── Join Room ──────────────────────────────────────────────────────────
-    socket.on('join-room', ({ roomCode, roomId, roomName, name, role }, callback) => {
+    socket.on('join-room', async ({ roomCode, roomId, roomName, name, role }, callback) => {
         console.log(`[Socket] join-room: ${name} (${role}) -> ${roomCode}`);
-        const currentCount = roomManager.getParticipantCount(roomCode);
-        if (currentCount >= 5) return callback({ error: 'Room is full (max 5 participants)' });
+        try {
+            // Always look up max_participants from DB for this room
+            let maxParticipants = 30;
+            try {
+                const { rows: roomRows } = await db.query(
+                    'SELECT max_participants FROM rooms WHERE code = $1', [roomCode]
+                );
+                if (roomRows.length > 0) {
+                    maxParticipants = roomRows[0].max_participants || 30;
+                    roomManager.setMaxParticipants(roomCode, maxParticipants);
+                }
+            } catch (e) { /* use cached or default */ maxParticipants = roomManager.getMaxParticipants(roomCode); }
 
-        roomManager.addParticipant(roomCode, socket.id, { name, role, roomId });
-        socket.join(roomCode);
+            const currentCount = roomManager.getParticipantCount(roomCode);
+            if (currentCount >= maxParticipants) return callback({ error: `Room is full (max ${maxParticipants} participants)` });
 
-        // If this is the teacher and no spotlight is set yet, spotlight defaults to themselves
-        if (role === 'teacher' && !roomManager.getSpotlight(roomCode)) {
-            roomManager.setSpotlight(roomCode, socket.id);
-        }
+            roomManager.addParticipant(roomCode, socket.id, { name, role, roomId });
+            socket.join(roomCode);
 
-        // If teacher rejoined, cancel any no-teacher grace timer
-        if (role === 'teacher' && teacherGraceTimers.has(roomCode)) {
-            clearTimeout(teacherGraceTimers.get(roomCode));
-            teacherGraceTimers.delete(roomCode);
-            // Notify students the teacher is back
-            socket.to(roomCode).emit('teacher-joined');
-        }
-
-        const existingParticipants = roomManager
-            .getParticipants(roomCode)
-            .filter((p) => p.socketId !== socket.id);
-
-        const currentSpotlight = roomManager.getSpotlight(roomCode);
-        const teacherPresent = !!roomManager.getTeacherSocketId(roomCode);
-
-        socket.to(roomCode).emit('participant-joined', { socketId: socket.id, name, role });
-        console.log(`[Room ${roomCode}] ${name} joined. Total: ${currentCount + 1}`);
-
-        // If student joins and no teacher present, start a grace timer for this student
-        if (role === 'student' && !teacherPresent) {
-            console.log(`[Room ${roomCode}] Student joined with no teacher — grace timer started`);
-            if (!teacherGraceTimers.has(roomCode)) {
-                io.to(roomCode).emit('teacher-disconnected', { graceSeconds: TEACHER_GRACE_MS / 1000 });
-                const timer = setTimeout(async () => {
-                    teacherGraceTimers.delete(roomCode);
-                    console.log(`[Room ${roomCode}] Grace expired (no teacher) — ending room`);
-                    if (roomId) await endRoom(roomCode, roomId);
-                    else io.to(roomCode).emit('room-ended');
-                }, TEACHER_GRACE_MS);
-                teacherGraceTimers.set(roomCode, timer);
+            // If this is the teacher and no spotlight is set yet, spotlight defaults to themselves
+            if (role === 'teacher' && !roomManager.getSpotlight(roomCode)) {
+                roomManager.setSpotlight(roomCode, socket.id);
             }
-        }
 
-        callback({ success: true, roomId, roomName: roomName || roomCode, existingParticipants, currentSpotlight, teacherPresent });
+            // If teacher rejoined, cancel any no-teacher grace timer
+            if (role === 'teacher' && teacherGraceTimers.has(roomCode)) {
+                clearTimeout(teacherGraceTimers.get(roomCode));
+                teacherGraceTimers.delete(roomCode);
+                // Notify students the teacher is back
+                socket.to(roomCode).emit('teacher-joined');
+            }
+
+            const existingParticipants = roomManager
+                .getParticipants(roomCode)
+                .filter((p) => p.socketId !== socket.id);
+
+            const currentSpotlight = roomManager.getSpotlight(roomCode);
+            const teacherPresent = !!roomManager.getTeacherSocketId(roomCode);
+
+            socket.to(roomCode).emit('participant-joined', { socketId: socket.id, name, role });
+            console.log(`[Room ${roomCode}] ${name} joined. Total: ${currentCount + 1}`);
+
+            // If student joins and no teacher present, start a grace timer for this student
+            if (role === 'student' && !teacherPresent) {
+                console.log(`[Room ${roomCode}] Student joined with no teacher — grace timer started`);
+                if (!teacherGraceTimers.has(roomCode)) {
+                    io.to(roomCode).emit('teacher-disconnected', { graceSeconds: TEACHER_GRACE_MS / 1000 });
+                    const timer = setTimeout(async () => {
+                        teacherGraceTimers.delete(roomCode);
+                        console.log(`[Room ${roomCode}] Grace expired (no teacher) — ending room`);
+                        if (roomId) await endRoom(roomCode, roomId);
+                        else io.to(roomCode).emit('room-ended');
+                    }, TEACHER_GRACE_MS);
+                    teacherGraceTimers.set(roomCode, timer);
+                }
+            }
+
+            callback({ success: true, roomId, roomName: roomName || roomCode, existingParticipants, currentSpotlight, teacherPresent });
+        } catch (err) {
+            console.error('[join-room] error:', err.message);
+            callback({ error: err.message });
+        }
     });
+
 
     // ── WebRTC Signaling ───────────────────────────────────────────────────
     socket.on('signal', ({ to, signal }) => {
@@ -1109,6 +1424,59 @@ server.listen(PORT, async () => {
         console.log('[migrate] chat_requests table ready');
     } catch (err) {
         console.warn('[migrate] chat_requests table:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS admin_meetings (
+                id UUID PRIMARY KEY,
+                room_code TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                scheduled_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                max_participants INTEGER DEFAULT 30,
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS admin_meeting_targets (
+                id SERIAL PRIMARY KEY,
+                meeting_id UUID NOT NULL REFERENCES admin_meetings(id) ON DELETE CASCADE,
+                target_type TEXT NOT NULL CHECK (target_type IN ('role','room','user')),
+                target_value TEXT NOT NULL
+            )
+        `);
+        console.log('[migrate] admin_meetings + admin_meeting_targets ready');
+    } catch (err) {
+        console.warn('[migrate] admin_meetings tables:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS teacher_sessions (
+                id UUID PRIMARY KEY,
+                room_code TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                scheduled_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                max_participants INTEGER DEFAULT 30,
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS teacher_session_targets (
+                id SERIAL PRIMARY KEY,
+                session_id UUID NOT NULL REFERENCES teacher_sessions(id) ON DELETE CASCADE,
+                target_user_id TEXT NOT NULL
+            )
+        `);
+        console.log('[migrate] teacher_sessions + teacher_session_targets ready');
+    } catch (err) {
+        console.warn('[migrate] teacher_sessions tables:', err.message);
     }
     console.log(`🚀 ClassMeet server running on port ${PORT}`);
     console.log(`   InsForge: ${process.env.INSFORGE_BASE_URL}`);
