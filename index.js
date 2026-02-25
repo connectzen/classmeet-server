@@ -853,6 +853,20 @@ app.get('/api/enrollments/:userId', async (req, res) => {
     res.json(result);
 });
 
+// Get enrolled students for a specific class (for edit modal)
+app.get('/api/enrollments/class/:roomId', async (req, res) => {
+    const { roomId } = req.params;
+    try {
+        const { rows } = await db.query(
+            'SELECT user_id FROM student_enrollments WHERE room_id = $1',
+            [roomId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Create room (server-side to avoid client-auth/RLS issues)
 app.post('/api/rooms', async (req, res) => {
     const { code, name, hostId } = req.body;
@@ -871,6 +885,47 @@ app.post('/api/rooms', async (req, res) => {
         return res.status(500).json({ error: error?.message || 'Failed to create room' });
     }
     res.json(data[0]);
+});
+
+// Update class (name + enrolled students)
+app.put('/api/rooms/:roomId', async (req, res) => {
+    const { roomId } = req.params;
+    const { name, enrolledStudentIds, hostId } = req.body;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    try {
+        // 1. Verify ownership
+        const { data: room, error: roomErr } = await insforge.database
+            .from('rooms')
+            .select('id, code, host_id')
+            .eq('id', roomId)
+            .maybeSingle();
+        if (roomErr || !room) return res.status(404).json({ error: 'Room not found' });
+        if (room.host_id !== hostId) return res.status(403).json({ error: 'Not authorized' });
+
+        // 2. Update room name
+        const { error: updateErr } = await insforge.database
+            .from('rooms')
+            .update({ name })
+            .eq('id', roomId);
+        if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+        // 3. Update student enrollments — remove then re-add
+        await db.query('DELETE FROM student_enrollments WHERE room_id = $1', [roomId]);
+        if (Array.isArray(enrolledStudentIds) && enrolledStudentIds.length > 0) {
+            for (const studentId of enrolledStudentIds) {
+                await db.query(
+                    `INSERT INTO student_enrollments (user_id, room_id, room_code, room_name)
+                     VALUES ($1, $2, $3, $4)`,
+                    [studentId, roomId, room.code, name]
+                );
+            }
+        }
+
+        res.json({ success: true, room: { id: room.id, code: room.code, name } });
+    } catch (err) {
+        console.error('[REST] Error updating room:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ─── ADMIN MEETINGS ──────────────────────────────────────────────────────
