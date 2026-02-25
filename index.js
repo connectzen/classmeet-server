@@ -370,7 +370,6 @@ app.patch('/api/profile/sync-name', async (req, res) => {
             `UPDATE user_roles SET name = $1 WHERE user_id = $2`,
             [name.trim(), userId]
         );
-        // Also sync chat_messages sender_name for future messages (existing messages keep historical name)
         // Emit refresh so admin dashboards show updated name immediately
         io.emit('admin:refresh', { type: 'students' });
         io.emit('admin:refresh', { type: 'teachers' });
