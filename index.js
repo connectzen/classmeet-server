@@ -401,13 +401,30 @@ app.get('/api/pending-users', async (req, res) => {
                 created_at: u.created_at || u.createdAt || null,
             }));
 
-        res.json(pending);
+        const pendingIds = pending.map(p => p.id);
+        let onboardingMap = {};
+        if (pendingIds.length > 0) {
+            const { rows: onboardingRows } = await db.query(
+                'SELECT user_id, role_interest, areas_of_interest FROM user_onboarding WHERE user_id = ANY($1)',
+                [pendingIds]
+            );
+            onboardingRows.forEach(r => {
+                onboardingMap[r.user_id] = { role_interest: r.role_interest, areas_of_interest: r.areas_of_interest || '' };
+            });
+        }
+        const pendingWithRole = pending.map(p => ({
+            ...p,
+            role_interest: onboardingMap[p.id]?.role_interest || null,
+            areas_of_interest: onboardingMap[p.id]?.areas_of_interest || null,
+        }));
+
+        res.json(pendingWithRole);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ── Onboarding (new users: store preferences and create user_roles) ───────
+// ── Onboarding (new users: store preferences only; do NOT assign role — invite users use claim-invite) ───────
 app.post('/api/onboarding', async (req, res) => {
     const { userId, name, email, roleInterest, areasOfInterest, currentSituation, goals } = req.body;
     if (!userId || !roleInterest) return res.status(400).json({ error: 'userId and roleInterest are required' });
@@ -421,13 +438,8 @@ app.post('/api/onboarding', async (req, res) => {
              current_situation = EXCLUDED.current_situation, goals = EXCLUDED.goals, onboarding_completed = TRUE`,
             [userId, role, areasOfInterest || '', currentSituation || '', goals || '']
         );
-        await db.query(
-            `INSERT INTO user_roles (user_id, role, name, email) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name, email = EXCLUDED.email`,
-            [userId, role, name || '', email || '']
-        );
         io.emit('admin:refresh', { type: 'pending' });
-        res.json({ success: true, role });
+        res.json({ success: true, role: 'pending' });
     } catch (err) {
         console.error('[onboarding]', err.message);
         res.status(500).json({ error: err.message });
@@ -2021,6 +2033,7 @@ async function endRoom(roomCode, roomId) {
 }
 
 // ─── SOCKET.IO ───────────────────────────────────────────────────────────
+const guestRoomHostByRoomCode = new Map();
 
 io.on('connection', (socket) => {
     console.log(`[+] ${socket.id}`);
@@ -2039,7 +2052,7 @@ io.on('connection', (socket) => {
     });
 
     // ── Join Room ──────────────────────────────────────────────────────────
-    socket.on('join-room', async ({ roomCode, roomId, roomName, name, role }, callback) => {
+    socket.on('join-room', async ({ roomCode, roomId, roomName, name, role, isGuestRoomHost }, callback) => {
         console.log(`[Socket] join-room: ${name} (${role}) -> ${roomCode}`);
         try {
             // Always look up max_participants from DB for this room
@@ -2060,6 +2073,10 @@ io.on('connection', (socket) => {
             roomManager.addParticipant(roomCode, socket.id, { name, role, roomId });
             socket.join(roomCode);
             if (role === 'guest') incrementGuestCount();
+
+            if (isGuestRoomHost && role === 'teacher') {
+                guestRoomHostByRoomCode.set(roomCode, socket.id);
+            }
 
             // If this is the teacher and no spotlight is set yet, spotlight defaults to themselves
             if (role === 'teacher' && !roomManager.getSpotlight(roomCode)) {
@@ -2239,7 +2256,17 @@ io.on('connection', (socket) => {
             io.to(roomCode).emit('spotlight-changed', { spotlightSocketId: fallback });
         }
 
-        // Teacher disconnect: start grace period
+        // Guest room host left or disconnected — end room immediately for everyone (no grace)
+        if (guestRoomHostByRoomCode.get(roomCode) === socket.id) {
+            guestRoomHostByRoomCode.delete(roomCode);
+            const roomId = info?.roomId;
+            console.log(`[Room ${roomCode}] Guest room host left — ending room`);
+            if (roomId) endRoom(roomCode, roomId).catch(() => {});
+            else io.to(roomCode).emit('room-ended');
+            return;
+        }
+
+        // Teacher disconnect (non-guest): start grace period
         if (wasTeacher && !intentional) {
             const roomId = info?.roomId;
             console.log(`[Room ${roomCode}] Teacher disconnected — ${TEACHER_GRACE_MS / 1000}s grace period started`);
