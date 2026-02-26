@@ -1374,15 +1374,15 @@ app.post('/api/teacher/upload-session-image', upload.single('file'), async (req,
 
 // ─── TEACHER SESSIONS ──────────────────────────────────────────────────────
 
-// Create a teacher session (teacher only)
+// Create a teacher session (teacher or member; member = guest session, no targets)
 app.post('/api/teacher/sessions', async (req, res) => {
     const { title, description, scheduledAt, maxParticipants = 30, targetStudentIds, createdBy, sessionImageUrl } = req.body;
     if (!title || !scheduledAt || !createdBy) return res.status(400).json({ error: 'Missing required fields' });
-    // Verify teacher role
     try {
         const { rows: roleRows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [createdBy]);
-        if (!roleRows.length || (roleRows[0].role !== 'teacher')) {
-            return res.status(403).json({ error: 'Teacher only' });
+        const role = roleRows.length ? roleRows[0].role : null;
+        if (!role || (role !== 'teacher' && role !== 'member')) {
+            return res.status(403).json({ error: 'Teacher or member only' });
         }
     } catch (err) {
         return res.status(500).json({ error: err.message });
@@ -1452,6 +1452,38 @@ app.get('/api/teacher/sessions/for-student/:userId', async (req, res) => {
             [userId]
         );
         res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get session by room code (for guest landing page)
+app.get('/api/session-by-code/:code', async (req, res) => {
+    const code = (req.params.code || '').toUpperCase();
+    if (!code) return res.status(400).json({ error: 'Code required' });
+    try {
+        const { rows } = await db.query(
+            `SELECT ts.id, ts.room_code, ts.room_id, ts.title, ts.description, ts.scheduled_at, ts.session_image_url, ts.created_by, ts.max_participants, ts.is_active,
+             ur.name AS creator_name
+             FROM teacher_sessions ts
+             LEFT JOIN user_roles ur ON ur.user_id = ts.created_by
+             WHERE UPPER(ts.room_code) = $1 AND ts.is_active = true`,
+            [code]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Session not found' });
+        const s = rows[0];
+        res.json({
+            id: s.id,
+            room_code: s.room_code,
+            room_id: s.room_id,
+            title: s.title,
+            description: s.description || '',
+            scheduled_at: s.scheduled_at,
+            session_image_url: s.session_image_url,
+            created_by: s.created_by,
+            max_participants: s.max_participants,
+            creator_name: s.creator_name || null,
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
