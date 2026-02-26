@@ -29,7 +29,7 @@ async function setupDatabase() {
         `CREATE TABLE IF NOT EXISTS user_roles (
             id          SERIAL PRIMARY KEY,
             user_id     UUID UNIQUE NOT NULL,
-            role        TEXT NOT NULL CHECK (role IN ('admin', 'teacher', 'student')),
+            role        TEXT NOT NULL CHECK (role IN ('admin', 'member', 'teacher', 'student')),
             name        TEXT,
             email       TEXT,
             assigned_by UUID,
@@ -128,7 +128,50 @@ async function setupDatabase() {
             teacher_feedback TEXT,
             UNIQUE(submission_id, question_id)
         )`,
-        `CREATE INDEX IF NOT EXISTS idx_quiz_answers_submission_id ON quiz_answers(submission_id)`
+        `CREATE INDEX IF NOT EXISTS idx_quiz_answers_submission_id ON quiz_answers(submission_id)`,
+
+        // ── Onboarding ─────────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS user_onboarding (
+            user_id              UUID PRIMARY KEY,
+            role_interest        TEXT NOT NULL CHECK (role_interest IN ('member', 'teacher', 'student')),
+            areas_of_interest    TEXT,
+            current_situation    TEXT,
+            goals                TEXT,
+            onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at           TIMESTAMPTZ DEFAULT NOW()
+        )`,
+
+        // ── Invite links ───────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS invite_links (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            token       TEXT UNIQUE NOT NULL,
+            role        TEXT NOT NULL CHECK (role IN ('student', 'teacher')),
+            created_by  UUID NOT NULL,
+            used_by     UUID,
+            used_at     TIMESTAMPTZ,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_invite_links_created_by ON invite_links(created_by)`,
+
+        // ── Guest rooms ────────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS guest_rooms (
+            id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            room_id    TEXT NOT NULL,
+            room_code  TEXT NOT NULL UNIQUE,
+            host_id    UUID NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            ended_at   TIMESTAMPTZ
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_guest_rooms_host_id ON guest_rooms(host_id)`,
+
+        // ── Courses ─────────────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS courses (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            title       TEXT NOT NULL,
+            created_by  UUID NOT NULL,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_courses_created_by ON courses(created_by)`
     ];
 
     for (const sql of statements) {

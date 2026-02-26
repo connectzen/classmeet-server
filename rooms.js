@@ -40,10 +40,12 @@ class RoomManager {
     removeParticipant(socketId) {
         let removedFrom = null;
         let wasTeacher = false;
+        let role = null;
         for (const [code, room] of this.rooms) {
             if (room.participants.has(socketId)) {
                 const info = room.participants.get(socketId);
                 wasTeacher = info?.role === 'teacher';
+                role = info?.role || null;
                 room.participants.delete(socketId);
                 removedFrom = code;
                 if (wasTeacher && this.teacherMap.get(code) === socketId) {
@@ -56,7 +58,7 @@ class RoomManager {
                 break;
             }
         }
-        return { code: removedFrom, wasTeacher };
+        return { code: removedFrom, wasTeacher, role };
     }
 
     getTeacherSocketId(code) { return this.teacherMap.get(code) || null; }

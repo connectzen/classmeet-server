@@ -1,4 +1,5 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -304,6 +305,64 @@ app.get('/api/all-users', async (req, res) => {
     }
 });
 
+// Chat partners: who can this user DM? (role-based)
+app.get('/api/chat/partners/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const { rows: me } = await db.query(
+            'SELECT role, assigned_by FROM user_roles WHERE user_id = $1',
+            [userId]
+        );
+        const myRole = me[0]?.role;
+        const myAssignedBy = me[0]?.assigned_by;
+        const isAdmin = await isAdminUser(userId);
+
+        if (isAdmin) {
+            const { rows } = await db.query("SELECT user_id as id, name, email, role FROM user_roles ORDER BY name");
+            return res.json(rows);
+        }
+        if (myRole === 'member') {
+            const { rows } = await db.query(
+                "SELECT user_id as id, name, email, role FROM user_roles WHERE assigned_by = $1 ORDER BY name",
+                [userId]
+            );
+            return res.json(rows);
+        }
+        if (myRole === 'teacher') {
+            const { rows: myStudents } = await db.query(
+                "SELECT user_id as id, name, email, role FROM user_roles WHERE assigned_by = $1 AND role = 'student'",
+                [userId]
+            );
+            const partnerIds = myStudents.map(r => r.id);
+            if (myAssignedBy) {
+                const { rows: memberRow } = await db.query(
+                    "SELECT user_id as id, name, email, role FROM user_roles WHERE user_id = $1",
+                    [myAssignedBy]
+                );
+                if (memberRow.length && !partnerIds.includes(memberRow[0].id)) partnerIds.push(memberRow[0].id);
+            }
+            if (partnerIds.length === 0) return res.json([]);
+            const placeholders = partnerIds.map((_, i) => `$${i + 1}`).join(',');
+            const { rows } = await db.query(
+                `SELECT user_id as id, name, email, role FROM user_roles WHERE user_id IN (${placeholders}) ORDER BY name`,
+                partnerIds
+            );
+            return res.json(rows);
+        }
+        if (myRole === 'student') {
+            if (!myAssignedBy) return res.json([]);
+            const { rows } = await db.query(
+                "SELECT user_id as id, name, email, role FROM user_roles WHERE user_id = $1",
+                [myAssignedBy]
+            );
+            return res.json(rows);
+        }
+        res.json([]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Pending (not-yet-approved) users ──────────────────────────────────────
 app.get('/api/pending-users', async (req, res) => {
     try {
@@ -325,10 +384,15 @@ app.get('/api/pending-users', async (req, res) => {
         // Get all user_ids already assigned a role
         const { rows: roleRows } = await db.query('SELECT user_id FROM user_roles');
         const assignedIds = new Set(roleRows.map(r => r.user_id));
+        let rejectedIds = new Set();
+        try {
+            const { rows: rej } = await db.query('SELECT user_id FROM rejected_users');
+            rejectedIds = new Set(rej.map(r => r.user_id));
+        } catch (e) { /* table may not exist yet */ }
 
-        // Filter out admins and already-assigned users
+        // Filter out admins, assigned, and rejected users
         const pending = authUsers
-            .filter(u => !ADMIN_USER_IDS.has(u.id) && !assignedIds.has(u.id))
+            .filter(u => !ADMIN_USER_IDS.has(u.id) && !assignedIds.has(u.id) && !rejectedIds.has(u.id))
             .map(u => ({
                 id:         u.id,
                 name:       u.profile?.name || u.name || '',
@@ -342,18 +406,295 @@ app.get('/api/pending-users', async (req, res) => {
     }
 });
 
+// ── Onboarding (new users: store preferences and create user_roles) ───────
+app.post('/api/onboarding', async (req, res) => {
+    const { userId, name, email, roleInterest, areasOfInterest, currentSituation, goals } = req.body;
+    if (!userId || !roleInterest) return res.status(400).json({ error: 'userId and roleInterest are required' });
+    const role = roleInterest === 'member' || roleInterest === 'teacher' || roleInterest === 'student' ? roleInterest : 'student';
+    try {
+        await db.query(
+            `INSERT INTO user_onboarding (user_id, role_interest, areas_of_interest, current_situation, goals, onboarding_completed)
+             VALUES ($1, $2, $3, $4, $5, TRUE)
+             ON CONFLICT (user_id) DO UPDATE SET
+             role_interest = EXCLUDED.role_interest, areas_of_interest = EXCLUDED.areas_of_interest,
+             current_situation = EXCLUDED.current_situation, goals = EXCLUDED.goals, onboarding_completed = TRUE`,
+            [userId, role, areasOfInterest || '', currentSituation || '', goals || '']
+        );
+        await db.query(
+            `INSERT INTO user_roles (user_id, role, name, email) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name, email = EXCLUDED.email`,
+            [userId, role, name || '', email || '']
+        );
+        io.emit('admin:refresh', { type: 'pending' });
+        res.json({ success: true, role });
+    } catch (err) {
+        console.error('[onboarding]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Invite links (Member: student + teacher; Teacher: student only) ───────
+async function getRoleForUser(userId) {
+    if (await isAdminUser(userId)) return 'admin';
+    const { rows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [userId]);
+    return rows.length > 0 ? rows[0].role : null;
+}
+
+app.post('/api/invite-links', async (req, res) => {
+    const { role, createdBy } = req.body;
+    if (!createdBy || !role) return res.status(400).json({ error: 'createdBy and role are required' });
+    const allowedRole = role === 'student' || role === 'teacher' ? role : null;
+    if (!allowedRole) return res.status(400).json({ error: 'role must be student or teacher' });
+    try {
+        const creatorRole = await getRoleForUser(createdBy);
+        if (creatorRole === 'member') {
+            // Member can create student or teacher invite
+        } else if (creatorRole === 'teacher') {
+            if (allowedRole !== 'student') return res.status(403).json({ error: 'Teachers can only create student invite links' });
+        } else {
+            return res.status(403).json({ error: 'Only Members and Teachers can create invite links' });
+        }
+        const token = crypto.randomBytes(24).toString('hex');
+        await db.query(
+            'INSERT INTO invite_links (token, role, created_by) VALUES ($1, $2, $3)',
+            [token, allowedRole, createdBy]
+        );
+        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        const url = `${baseUrl.replace(/\/$/, '')}?invite=${token}`;
+        res.json({ url, token });
+    } catch (err) {
+        console.error('[invite-links]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/invite-links', async (req, res) => {
+    const { createdBy } = req.query;
+    if (!createdBy) return res.status(400).json({ error: 'createdBy is required' });
+    try {
+        const { rows } = await db.query(
+            'SELECT id, token, role, created_at FROM invite_links WHERE created_by = $1 AND used_by IS NULL ORDER BY created_at DESC',
+            [createdBy]
+        );
+        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        const base = baseUrl.replace(/\/$/, '');
+        res.json(rows.map(r => ({ ...r, url: `${base}?invite=${r.token}` })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/claim-invite', async (req, res) => {
+    const { token, userId, name, email } = req.body;
+    if (!token || !userId) return res.status(400).json({ error: 'token and userId are required' });
+    try {
+        const { rows } = await db.query(
+            'SELECT id, role, created_by FROM invite_links WHERE token = $1 AND used_by IS NULL',
+            [token]
+        );
+        if (rows.length === 0) return res.status(404).json({ error: 'Invalid or already used invite link' });
+        const { role, created_by: assignedBy } = rows[0];
+        await db.query(
+            `INSERT INTO user_roles (user_id, role, name, email, assigned_by) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name, email = EXCLUDED.email, assigned_by = EXCLUDED.assigned_by`,
+            [userId, role, name || '', email || '', assignedBy]
+        );
+        await db.query('UPDATE invite_links SET used_by = $1, used_at = NOW() WHERE token = $2', [userId, token]);
+        io.emit('admin:refresh', { type: 'pending' });
+        res.json({ success: true, role });
+    } catch (err) {
+        console.error('[claim-invite]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Reject a pending user (admin only) ────────────────────────────────────
+app.post('/api/reject-user/:userId', async (req, res) => {
+    const { userId } = req.params;
+    const { adminId } = req.body;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    try {
+        await db.query(
+            'CREATE TABLE IF NOT EXISTS rejected_users (user_id UUID PRIMARY KEY, rejected_at TIMESTAMPTZ DEFAULT NOW())'
+        );
+        await db.query(
+            'INSERT INTO rejected_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
+            [userId]
+        );
+        io.emit('admin:refresh', { type: 'pending' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Approve a pending user ────────────────────────────────────────────────
+const ALLOWED_ROLES = ['member', 'teacher', 'student'];
+function normalizeRole(r) {
+    return r && ALLOWED_ROLES.includes(r) ? r : 'student';
+}
+
 app.post('/api/approve-user/:userId', async (req, res) => {
     const { userId } = req.params;
     const { name, email, role = 'student' } = req.body;
+    const assignedRole = normalizeRole(role);
     try {
         await db.query(
             `INSERT INTO user_roles (user_id, role, name, email)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name`,
-            [userId, role, name || '', email || '']
+            [userId, assignedRole, name || '', email || '']
         );
         io.emit('admin:refresh', { type: 'pending' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Admin: assign/edit user role ──────────────────────────────────────────
+app.patch('/api/user-role/:userId', async (req, res) => {
+    const { userId } = req.params;
+    const { role, adminId } = req.body;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    const assignedRole = normalizeRole(role);
+    try {
+        const { rowCount } = await db.query(
+            'UPDATE user_roles SET role = $1 WHERE user_id = $2',
+            [assignedRole, userId]
+        );
+        if (rowCount === 0) return res.status(404).json({ error: 'User not found' });
+        io.emit('admin:refresh', { type: 'teachers' });
+        io.emit('admin:refresh', { type: 'students' });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Members list (admin) ──────────────────────────────────────────────────
+app.get('/api/members', async (req, res) => {
+    try {
+        const { rows } = await db.query(`
+            SELECT user_id, name, email, created_at
+            FROM user_roles
+            WHERE role = 'member'
+            ORDER BY created_at DESC
+        `);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Admin stats (counts + live guest; admin only) ────────────────────────
+let liveGuestCount = 0;
+function getLiveGuestCount() { return liveGuestCount; }
+function incrementGuestCount() { liveGuestCount += 1; }
+function decrementGuestCount() { liveGuestCount = Math.max(0, liveGuestCount - 1); }
+
+app.get('/api/admin/stats', async (req, res) => {
+    const { adminId } = req.query;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    try {
+        const { rows: counts } = await db.query(`
+            SELECT role, COUNT(*)::int AS c FROM user_roles WHERE role IN ('member', 'teacher', 'student') GROUP BY role
+        `);
+        const byRole = { member: 0, teacher: 0, student: 0 };
+        counts.forEach(r => { byRole[r.role] = r.c; });
+        res.json({
+            membersCount: byRole.member,
+            teachersCount: byRole.teacher,
+            studentsCount: byRole.student,
+            liveGuestCount: getLiveGuestCount(),
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Admin health (admin only) ─────────────────────────────────────────────
+app.get('/api/admin/health', async (req, res) => {
+    const { adminId } = req.query;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    try {
+        await db.query('SELECT 1');
+        res.json({ status: 'ok', database: 'connected' });
+    } catch (err) {
+        res.status(503).json({ status: 'degraded', error: err.message });
+    }
+});
+
+// ── Admin backend stats (storage stub; admin only) ────────────────────────
+app.get('/api/admin/backend-stats', async (req, res) => {
+    const { adminId } = req.query;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    try {
+        res.json({
+            storageUsed: null,
+            storageAvailable: null,
+            message: 'Storage metrics require InsForge Storage API; configure if needed.',
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Guest rooms (Member only: create, join, end) ─────────────────────────
+app.post('/api/guest-rooms', async (req, res) => {
+    const { hostId } = req.body;
+    if (!hostId) return res.status(400).json({ error: 'hostId required' });
+    try {
+        const role = await getRoleForUser(hostId);
+        if (role !== 'member') return res.status(403).json({ error: 'Only members can create guest rooms' });
+        const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+        const title = `Guest Room ${code}`;
+        const { data: roomData, error: roomError } = await insforge.database
+            .from('rooms')
+            .insert([{ code, name: title, host_id: hostId, max_participants: 100 }])
+            .select();
+        if (roomError || !roomData?.[0]) return res.status(500).json({ error: roomError?.message || 'Failed to create room' });
+        const roomId = roomData[0].id;
+        const { rows } = await db.query(
+            'INSERT INTO guest_rooms (room_id, room_code, host_id) VALUES ($1, $2, $3) RETURNING id, room_id, room_code, created_at',
+            [roomId, code, hostId]
+        );
+        const guestRoom = rows[0];
+        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        const url = `${baseUrl.replace(/\/$/, '')}?guest=${code}`;
+        res.json({ ...guestRoom, url, roomName: title });
+    } catch (err) {
+        console.error('[guest-rooms]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/guest-rooms/join/:code', async (req, res) => {
+    const { code } = req.params;
+    try {
+        const { rows } = await db.query(
+            'SELECT id, room_id, room_code, host_id FROM guest_rooms WHERE room_code = $1 AND ended_at IS NULL',
+            [code.toUpperCase()]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Invalid or expired guest link' });
+        res.json({ roomId: rows[0].room_id, roomCode: rows[0].room_code, roomName: `Guest Room ${rows[0].room_code}` });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/guest-rooms/:id', async (req, res) => {
+    const { id } = req.params;
+    const { hostId } = req.body;
+    if (!hostId) return res.status(400).json({ error: 'hostId required' });
+    try {
+        const role = await getRoleForUser(hostId);
+        if (role !== 'member') return res.status(403).json({ error: 'Only members can end guest rooms' });
+        const { rows } = await db.query('SELECT * FROM guest_rooms WHERE id = $1 AND host_id = $2', [id, hostId]);
+        if (!rows.length) return res.status(404).json({ error: 'Guest room not found' });
+        const gr = rows[0];
+        await db.query('UPDATE guest_rooms SET ended_at = NOW() WHERE id = $1', [id]);
+        try { await endRoom(gr.room_code, gr.room_id); } catch (e) { /* ignore */ }
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1210,21 +1551,67 @@ app.post('/api/quiz/upload', upload.single('file'), async (req, res) => {
 });
 
 // Create quiz
-app.post('/api/quizzes', async (req, res) => {
-    const { title, roomId, timeLimitMinutes, createdBy } = req.body;
-    if (!title || !roomId || !createdBy) return res.status(400).json({ error: 'title, roomId, createdBy required' });
+// ── Courses CRUD (Member, Teacher, Admin) ──────────────────────────────────
+app.post('/api/courses', async (req, res) => {
+    const { title, createdBy } = req.body;
+    if (!title || !createdBy) return res.status(400).json({ error: 'title and createdBy required' });
     try {
-        // Verify the creator is a teacher or admin — students cannot create quizzes
-        const { rows: roleRows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [createdBy]);
-        const role = roleRows[0]?.role;
-        const isAdmin = await isAdminUser(createdBy);
-        if (role !== 'teacher' && !isAdmin) {
-            return res.status(403).json({ error: 'Only teachers and admins can create quizzes' });
+        const creatorRole = await getRoleForUser(createdBy);
+        if (creatorRole !== 'member' && creatorRole !== 'teacher' && creatorRole !== 'admin') {
+            return res.status(403).json({ error: 'Only members, teachers, and admins can create courses' });
         }
         const { rows } = await db.query(
-            `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes)
-             VALUES ($1, $2, $3, $4) RETURNING *`,
-            [title.trim(), roomId, createdBy, timeLimitMinutes || null]
+            'INSERT INTO courses (title, created_by) VALUES ($1, $2) RETURNING *',
+            [title.trim(), createdBy]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/courses', async (req, res) => {
+    const { createdBy } = req.query;
+    if (!createdBy) return res.status(400).json({ error: 'createdBy required' });
+    try {
+        const { rows } = await db.query(
+            'SELECT * FROM courses WHERE created_by = $1 ORDER BY created_at DESC',
+            [createdBy]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/courses/:id', async (req, res) => {
+    const { title } = req.body;
+    try {
+        const { rows } = await db.query(
+            'UPDATE courses SET title = COALESCE($1, title) WHERE id = $2 RETURNING *',
+            [title || null, req.params.id]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/courses/:id', async (req, res) => {
+    try {
+        await db.query('DELETE FROM courses WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/quizzes', async (req, res) => {
+    const { title, roomId, courseId, timeLimitMinutes, createdBy } = req.body;
+    if (!title || !createdBy) return res.status(400).json({ error: 'title and createdBy required' });
+    const room = roomId || null;
+    try {
+        const creatorRole = await getRoleForUser(createdBy);
+        if (creatorRole !== 'member' && creatorRole !== 'teacher' && creatorRole !== 'admin') {
+            return res.status(403).json({ error: 'Only members, teachers, and admins can create quizzes' });
+        }
+        const { rows } = await db.query(
+            `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes, course_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [title.trim(), room || (courseId || 'placeholder'), createdBy, timeLimitMinutes || null, courseId || null]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1614,6 +2001,7 @@ io.on('connection', (socket) => {
 
             roomManager.addParticipant(roomCode, socket.id, { name, role, roomId });
             socket.join(roomCode);
+            if (role === 'guest') incrementGuestCount();
 
             // If this is the teacher and no spotlight is set yet, spotlight defaults to themselves
             if (role === 'teacher' && !roomManager.getSpotlight(roomCode)) {
@@ -1772,7 +2160,8 @@ io.on('connection', (socket) => {
         if (!roomCode) return;
 
         const info = roomManager.getParticipantInfo(socket.id);
-        const { wasTeacher } = roomManager.removeParticipant(socket.id);
+        const { wasTeacher, role } = roomManager.removeParticipant(socket.id);
+        if (role === 'guest') decrementGuestCount();
         socket.to(roomCode).emit('participant-left', { socketId: socket.id });
         console.log(`[-] ${info?.name || socket.id} left ${roomCode}`);
 
@@ -1895,6 +2284,69 @@ server.listen(PORT, async () => {
         console.log('[migrate] teacher_sessions + teacher_session_targets ready');
     } catch (err) {
         console.warn('[migrate] teacher_sessions tables:', err.message);
+    }
+    // ── Role system: allow 'member' in user_roles ─────────────────────────
+    try {
+        await db.query(`ALTER TABLE user_roles DROP CONSTRAINT IF EXISTS user_roles_role_check`);
+        await db.query(`ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'member', 'teacher', 'student'))`);
+        console.log('[migrate] user_roles member role ready');
+    } catch (err) {
+        console.warn('[migrate] user_roles role check:', err.message);
+    }
+    // ── user_onboarding, invite_links, guest_rooms, courses ───────────────
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS user_onboarding (
+                user_id              UUID PRIMARY KEY,
+                role_interest        TEXT NOT NULL CHECK (role_interest IN ('member', 'teacher', 'student')),
+                areas_of_interest    TEXT,
+                current_situation    TEXT,
+                goals                TEXT,
+                onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at           TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS invite_links (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                token       TEXT UNIQUE NOT NULL,
+                role        TEXT NOT NULL CHECK (role IN ('student', 'teacher')),
+                created_by  UUID NOT NULL,
+                used_by     UUID,
+                used_at     TIMESTAMPTZ,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_invite_links_created_by ON invite_links(created_by)`);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS guest_rooms (
+                id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                room_id    TEXT NOT NULL,
+                room_code  TEXT NOT NULL UNIQUE,
+                host_id    UUID NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                ended_at   TIMESTAMPTZ
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_guest_rooms_host_id ON guest_rooms(host_id)`);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS courses (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                title       TEXT NOT NULL,
+                created_by  UUID NOT NULL,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_courses_created_by ON courses(created_by)`);
+        console.log('[migrate] user_onboarding, invite_links, guest_rooms, courses ready');
+    } catch (err) {
+        console.warn('[migrate] role system tables:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS course_id UUID`);
+        console.log('[migrate] quizzes.course_id ready');
+    } catch (err) {
+        console.warn('[migrate] quizzes.course_id:', err.message);
     }
     console.log(`🚀 ClassMeet server running on port ${PORT}`);
     console.log(`   InsForge: ${process.env.INSFORGE_BASE_URL}`);
