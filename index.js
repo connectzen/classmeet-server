@@ -994,12 +994,14 @@ app.get('/api/chat/conversations/:userId', async (req, res) => {
             [userId]
         );
 
-        // For DMs, fetch the other participant's info
+        // For DMs, fetch the other participant's info (current name/role from user_roles)
         const enriched = await Promise.all(convRows.map(async (conv) => {
             if (conv.type === 'dm') {
                 const { rows: others } = await db.query(
-                    `SELECT user_id, user_name, user_role FROM chat_participants
-                     WHERE conversation_id = $1 AND user_id != $2 LIMIT 1`,
+                    `SELECT cp.user_id, COALESCE(ur.name, cp.user_name) AS user_name, COALESCE(ur.role, cp.user_role) AS user_role
+                     FROM chat_participants cp
+                     LEFT JOIN user_roles ur ON ur.user_id = cp.user_id
+                     WHERE cp.conversation_id = $1 AND cp.user_id != $2 LIMIT 1`,
                     [conv.conversation_id, userId]
                 );
                 return { ...conv, other_user: others[0] || null };
