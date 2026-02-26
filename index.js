@@ -1466,7 +1466,7 @@ app.get('/api/session-by-code/:code', async (req, res) => {
             `SELECT ts.id, ts.room_code, ts.room_id, ts.title, ts.description, ts.scheduled_at, ts.session_image_url, ts.created_by, ts.max_participants, ts.is_active,
              ur.name AS creator_name
              FROM teacher_sessions ts
-             LEFT JOIN user_roles ur ON ur.user_id = ts.created_by
+             LEFT JOIN user_roles ur ON ur.user_id::text = ts.created_by
              WHERE UPPER(ts.room_code) = $1 AND ts.is_active = true`,
             [code]
         );
