@@ -736,6 +736,64 @@ app.delete('/api/guest-rooms/:id', async (req, res) => {
     }
 });
 
+// ── Profile avatar upload (server-side so upload works regardless of bucket policy) ──
+app.post('/api/profile/upload-avatar', upload.single('file'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const userId = req.body?.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    try {
+        const baseUrl = process.env.INSFORGE_BASE_URL;
+        const apiKey  = process.env.INSFORGE_API_KEY;
+        if (!baseUrl || !apiKey) return res.status(500).json({ error: 'Storage not configured' });
+        const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const filename = `avatar-${userId}.${ext || 'jpg'}`;
+
+        const stratRes = await fetch(`${baseUrl}/api/storage/buckets/avatars/upload-strategy`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, contentType: req.file.mimetype, size: req.file.size }),
+        });
+        if (!stratRes.ok) return res.status(500).json({ error: 'Strategy failed: ' + await stratRes.text() });
+        const strategy = await stratRes.json();
+
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        let publicUrl;
+
+        if (strategy.method === 'direct') {
+            const uploadUrl = strategy.uploadUrl.startsWith('http') ? strategy.uploadUrl : `${baseUrl}${strategy.uploadUrl}`;
+            const form = new FormData();
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(uploadUrl, {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                body: form,
+            });
+            if (!upRes.ok) return res.status(500).json({ error: 'Upload failed: ' + await upRes.text() });
+            publicUrl = uploadUrl;
+        } else {
+            const form = new FormData();
+            for (const [k, v] of Object.entries(strategy.fields || {})) form.append(k, String(v));
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(strategy.uploadUrl, { method: 'POST', body: form });
+            if (!upRes.ok) return res.status(500).json({ error: 'S3 upload failed: ' + await upRes.text() });
+            if (strategy.confirmRequired && strategy.confirmUrl) {
+                const confirmUrl = strategy.confirmUrl.startsWith('http') ? strategy.confirmUrl : `${baseUrl}${strategy.confirmUrl}`;
+                await fetch(confirmUrl, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ size: req.file.size, contentType: req.file.mimetype }),
+                });
+            }
+            publicUrl = `${baseUrl}/api/storage/buckets/avatars/objects/${strategy.key}`;
+        }
+
+        res.json({ url: publicUrl, name: req.file.originalname, type: req.file.mimetype });
+    } catch (err) {
+        console.error('[profile/upload-avatar]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Sync profile name from InsForge to user_roles ────────────────────────
 // Called by the client after insforge.auth.setProfile() succeeds
 app.patch('/api/profile/sync-name', async (req, res) => {
