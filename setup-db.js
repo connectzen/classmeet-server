@@ -79,7 +79,56 @@ async function setupDatabase() {
             is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
             created_at      TIMESTAMPTZ DEFAULT NOW()
         )`,
-        `CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id)`
+        `CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id)`,
+
+        // ── Quiz System ───────────────────────────────────────────────────
+        `CREATE TABLE IF NOT EXISTS quizzes (
+            id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            title               TEXT NOT NULL,
+            room_id             TEXT NOT NULL,
+            created_by          TEXT NOT NULL,
+            time_limit_minutes  INTEGER,
+            status              TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published')),
+            created_at          TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_quizzes_room_id ON quizzes(room_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_quizzes_created_by ON quizzes(created_by)`,
+        `CREATE TABLE IF NOT EXISTS quiz_questions (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            quiz_id          UUID NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+            type             TEXT NOT NULL CHECK (type IN ('text','select','multi-select','recording','video','upload')),
+            question_text    TEXT NOT NULL,
+            options          JSONB,
+            correct_answers  JSONB,
+            video_url        TEXT,
+            order_index      INTEGER NOT NULL DEFAULT 0,
+            points           INTEGER NOT NULL DEFAULT 1
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_quiz_questions_quiz_id ON quiz_questions(quiz_id)`,
+        `CREATE TABLE IF NOT EXISTS quiz_submissions (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            quiz_id          UUID NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+            student_id       TEXT NOT NULL,
+            student_name     TEXT NOT NULL DEFAULT '',
+            started_at       TIMESTAMPTZ DEFAULT NOW(),
+            submitted_at     TIMESTAMPTZ,
+            score            NUMERIC,
+            UNIQUE(quiz_id, student_id)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_quiz_submissions_quiz_id ON quiz_submissions(quiz_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_quiz_submissions_student_id ON quiz_submissions(student_id)`,
+        `CREATE TABLE IF NOT EXISTS quiz_answers (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            submission_id    UUID NOT NULL REFERENCES quiz_submissions(id) ON DELETE CASCADE,
+            question_id      UUID NOT NULL REFERENCES quiz_questions(id) ON DELETE CASCADE,
+            answer_text      TEXT,
+            selected_options JSONB,
+            file_url         TEXT,
+            teacher_grade    NUMERIC,
+            teacher_feedback TEXT,
+            UNIQUE(submission_id, question_id)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_quiz_answers_submission_id ON quiz_answers(submission_id)`
     ];
 
     for (const sql of statements) {

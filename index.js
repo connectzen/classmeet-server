@@ -1165,6 +1165,402 @@ app.put('/api/teacher/sessions/:sessionId', async (req, res) => {
     }
 });
 
+// ─── QUIZ API ─────────────────────────────────────────────────────────────
+
+// Upload file/recording for quiz answers
+app.post('/api/quiz/upload', upload.single('file'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    try {
+        const baseUrl = process.env.INSFORGE_BASE_URL;
+        const apiKey  = process.env.INSFORGE_API_KEY;
+        const ext     = req.file.originalname.split('.').pop() || 'bin';
+        const filename = `quiz-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+        const stratRes = await fetch(`${baseUrl}/api/storage/buckets/chat-media/upload-strategy`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, contentType: req.file.mimetype, size: req.file.size }),
+        });
+        if (!stratRes.ok) return res.status(500).json({ error: 'Strategy failed' });
+        const strategy = await stratRes.json();
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        let publicUrl;
+        if (strategy.method === 'direct') {
+            const uploadUrl = strategy.uploadUrl.startsWith('http') ? strategy.uploadUrl : `${baseUrl}${strategy.uploadUrl}`;
+            const form = new FormData();
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(uploadUrl, { method: 'PUT', headers: { 'Authorization': `Bearer ${apiKey}` }, body: form });
+            if (!upRes.ok) return res.status(500).json({ error: 'Upload failed' });
+            publicUrl = uploadUrl;
+        } else {
+            const form = new FormData();
+            for (const [k, v] of Object.entries(strategy.fields || {})) form.append(k, String(v));
+            form.append('file', fileBlob, req.file.originalname);
+            const upRes = await fetch(strategy.uploadUrl, { method: 'POST', body: form });
+            if (!upRes.ok) return res.status(500).json({ error: 'S3 upload failed' });
+            if (strategy.confirmRequired && strategy.confirmUrl) {
+                const confirmUrl = strategy.confirmUrl.startsWith('http') ? strategy.confirmUrl : `${baseUrl}${strategy.confirmUrl}`;
+                await fetch(confirmUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ size: req.file.size, contentType: req.file.mimetype }) });
+            }
+            publicUrl = `${baseUrl}/api/storage/buckets/chat-media/objects/${strategy.key}`;
+        }
+        res.json({ url: publicUrl, name: req.file.originalname, type: req.file.mimetype });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Create quiz
+app.post('/api/quizzes', async (req, res) => {
+    const { title, roomId, timeLimitMinutes, createdBy } = req.body;
+    if (!title || !roomId || !createdBy) return res.status(400).json({ error: 'title, roomId, createdBy required' });
+    try {
+        // Verify the creator is a teacher or admin — students cannot create quizzes
+        const { rows: roleRows } = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [createdBy]);
+        const role = roleRows[0]?.role;
+        const isAdmin = await isAdminUser(createdBy);
+        if (role !== 'teacher' && !isAdmin) {
+            return res.status(403).json({ error: 'Only teachers and admins can create quizzes' });
+        }
+        const { rows } = await db.query(
+            `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes)
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [title.trim(), roomId, createdBy, timeLimitMinutes || null]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// List quizzes for rooms (supports ?createdBy= for teacher, ?studentId= or ?roomIds= for student)
+app.get('/api/quizzes', async (req, res) => {
+    const { createdBy, roomIds, studentId, status } = req.query;
+    try {
+        if (createdBy) {
+            const { rows } = await db.query(
+                `SELECT q.*, COUNT(qq.id)::int AS question_count,
+                        COUNT(qs.id)::int AS submission_count
+                 FROM quizzes q
+                 LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id
+                 LEFT JOIN quiz_submissions qs ON qs.quiz_id = q.id
+                 WHERE q.created_by = $1
+                 GROUP BY q.id ORDER BY q.created_at DESC`,
+                [createdBy]
+            );
+            return res.json(rows);
+        }
+
+        // Student path: collect room IDs from both enrollments AND session targets
+        let ids = [];
+        if (studentId) {
+            const { rows: enRows } = await db.query(
+                `SELECT room_id FROM student_enrollments WHERE user_id = $1`, [studentId]
+            );
+            const { rows: tgtRows } = await db.query(
+                `SELECT ts.room_id
+                 FROM teacher_sessions ts
+                 JOIN teacher_session_targets tst ON tst.session_id = ts.id
+                 WHERE tst.target_user_id = $1`, [studentId]
+            );
+            const all = new Set([
+                ...enRows.map(r => r.room_id),
+                ...tgtRows.map(r => r.room_id),
+            ].filter(Boolean));
+            ids = [...all];
+        } else if (roomIds) {
+            ids = String(roomIds).split(',').filter(Boolean);
+        }
+
+        if (!ids.length) return res.json([]);
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+        const params = [...ids];
+        // Include this student's submission status when studentId is known
+        let subJoin = '', subSelect = '', subGroup = '';
+        if (studentId) {
+            params.push(String(studentId));
+            const sp = params.length;
+            subJoin   = `LEFT JOIN quiz_submissions sub ON sub.quiz_id = q.id AND sub.student_id = $${sp}`;
+            subSelect = `, sub.submitted_at AS submitted_at, sub.score AS my_score`;
+            subGroup  = `, sub.submitted_at, sub.score`;
+        }
+        const { rows } = await db.query(
+            `SELECT q.*, COUNT(qq.id)::int AS question_count${subSelect}
+             FROM quizzes q
+             LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id
+             ${subJoin}
+             WHERE q.room_id IN (${placeholders}) AND q.status = 'published'
+             GROUP BY q.id${subGroup} ORDER BY q.created_at DESC`,
+            params
+        );
+        return res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get one quiz with questions
+app.get('/api/quizzes/:id', async (req, res) => {
+    const { role } = req.query;
+    try {
+        const { rows: qRows } = await db.query('SELECT * FROM quizzes WHERE id = $1', [req.params.id]);
+        if (!qRows.length) return res.status(404).json({ error: 'Not found' });
+        const quiz = qRows[0];
+        const { rows: questions } = await db.query(
+            `SELECT id, quiz_id, type, question_text, options, video_url, order_index, points
+             ${role === 'teacher' ? ', correct_answers' : ''}
+             FROM quiz_questions WHERE quiz_id = $1 ORDER BY order_index ASC`,
+            [req.params.id]
+        );
+        res.json({ ...quiz, questions });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Update quiz (title, timeLimitMinutes)
+app.patch('/api/quizzes/:id', async (req, res) => {
+    const { title, timeLimitMinutes } = req.body;
+    try {
+        const { rows } = await db.query(
+            `UPDATE quizzes SET title = COALESCE($1, title), time_limit_minutes = $2 WHERE id = $3 RETURNING *`,
+            [title || null, timeLimitMinutes ?? null, req.params.id]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Publish quiz
+app.post('/api/quizzes/:id/publish', async (req, res) => {
+    try {
+        await db.query(`UPDATE quizzes SET status = 'published' WHERE id = $1`, [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Unpublish quiz back to draft
+app.post('/api/quizzes/:id/unpublish', async (req, res) => {
+    try {
+        await db.query(`UPDATE quizzes SET status = 'draft' WHERE id = $1`, [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete quiz
+app.delete('/api/quizzes/:id', async (req, res) => {
+    try {
+        await db.query('DELETE FROM quizzes WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Add question to quiz
+app.post('/api/quizzes/:id/questions', async (req, res) => {
+    const { type, questionText, options, correctAnswers, videoUrl, orderIndex, points } = req.body;
+    if (!type || !questionText) return res.status(400).json({ error: 'type and questionText required' });
+    try {
+        const { rows: existing } = await db.query(
+            'SELECT COALESCE(MAX(order_index), -1) + 1 AS next_index FROM quiz_questions WHERE quiz_id = $1',
+            [req.params.id]
+        );
+        const idx = orderIndex ?? existing[0].next_index;
+        const { rows } = await db.query(
+            `INSERT INTO quiz_questions (quiz_id, type, question_text, options, correct_answers, video_url, order_index, points)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [req.params.id, type, questionText.trim(), options ? JSON.stringify(options) : null,
+             correctAnswers ? JSON.stringify(correctAnswers) : null, videoUrl || null, idx, points || 1]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Update question
+app.put('/api/quiz-questions/:id', async (req, res) => {
+    const { type, questionText, options, correctAnswers, videoUrl, orderIndex, points } = req.body;
+    try {
+        const { rows } = await db.query(
+            `UPDATE quiz_questions SET
+                type = COALESCE($1, type),
+                question_text = COALESCE($2, question_text),
+                options = $3,
+                correct_answers = $4,
+                video_url = $5,
+                order_index = COALESCE($6, order_index),
+                points = COALESCE($7, points)
+             WHERE id = $8 RETURNING *`,
+            [type || null, questionText?.trim() || null,
+             options !== undefined ? JSON.stringify(options) : null,
+             correctAnswers !== undefined ? JSON.stringify(correctAnswers) : null,
+             videoUrl !== undefined ? videoUrl : null,
+             orderIndex ?? null, points || null, req.params.id]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete question
+app.delete('/api/quiz-questions/:id', async (req, res) => {
+    try {
+        await db.query('DELETE FROM quiz_questions WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Start quiz (student) — create submission row
+app.post('/api/quizzes/:id/start', async (req, res) => {
+    const { studentId, studentName } = req.body;
+    if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    try {
+        const { rows } = await db.query(
+            `INSERT INTO quiz_submissions (quiz_id, student_id, student_name)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (quiz_id, student_id) DO UPDATE SET student_name = EXCLUDED.student_name
+             RETURNING *`,
+            [req.params.id, studentId, studentName || '']
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get my submission for a quiz
+app.get('/api/quizzes/:id/my-submission', async (req, res) => {
+    const { studentId } = req.query;
+    if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    try {
+        const { rows: subRows } = await db.query(
+            'SELECT * FROM quiz_submissions WHERE quiz_id = $1 AND student_id = $2',
+            [req.params.id, studentId]
+        );
+        if (!subRows.length) return res.json(null);
+        const { rows: answers } = await db.query(
+            'SELECT * FROM quiz_answers WHERE submission_id = $1',
+            [subRows[0].id]
+        );
+        res.json({ ...subRows[0], answers });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Save answers (upsert, called as student works through quiz)
+app.post('/api/submissions/:submissionId/answers', async (req, res) => {
+    const { answers } = req.body; // [{ questionId, answerText, selectedOptions, fileUrl }]
+    if (!Array.isArray(answers)) return res.status(400).json({ error: 'answers array required' });
+    try {
+        for (const a of answers) {
+            await db.query(
+                `INSERT INTO quiz_answers (submission_id, question_id, answer_text, selected_options, file_url)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (submission_id, question_id) DO UPDATE SET
+                    answer_text = EXCLUDED.answer_text,
+                    selected_options = EXCLUDED.selected_options,
+                    file_url = EXCLUDED.file_url`,
+                [req.params.submissionId, a.questionId,
+                 a.answerText || null,
+                 a.selectedOptions !== undefined ? JSON.stringify(a.selectedOptions) : null,
+                 a.fileUrl || null]
+            );
+        }
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Submit quiz — auto-grade select/multi-select, mark submitted
+app.post('/api/submissions/:submissionId/submit', async (req, res) => {
+    const { submissionId } = req.params;
+    try {
+        // Get submission + quiz + answers + questions
+        const { rows: subRows } = await db.query('SELECT * FROM quiz_submissions WHERE id = $1', [submissionId]);
+        if (!subRows.length) return res.status(404).json({ error: 'Submission not found' });
+        const sub = subRows[0];
+
+        const { rows: questions } = await db.query(
+            'SELECT * FROM quiz_questions WHERE quiz_id = $1', [sub.quiz_id]
+        );
+        const { rows: answers } = await db.query(
+            'SELECT * FROM quiz_answers WHERE submission_id = $1', [submissionId]
+        );
+
+        let allTotalPoints = 0, autoTotalPoints = 0, earnedPoints = 0;
+        for (const q of questions) {
+            allTotalPoints += q.points;
+            if (q.type === 'select' || q.type === 'multi-select') {
+                autoTotalPoints += q.points;
+                const ans = answers.find(a => a.question_id === q.id);
+                if (ans && q.correct_answers) {
+                    const correct = Array.isArray(q.correct_answers) ? q.correct_answers : JSON.parse(q.correct_answers);
+                    const given   = ans.selected_options ? (Array.isArray(ans.selected_options) ? ans.selected_options : JSON.parse(ans.selected_options)) : [];
+                    const isRight = JSON.stringify([...correct].sort()) === JSON.stringify([...given].sort());
+                    const grade   = isRight ? q.points : 0;
+                    earnedPoints += grade;
+                    await db.query('UPDATE quiz_answers SET teacher_grade = $1 WHERE id = $2', [grade, ans.id]);
+                }
+            }
+        }
+        // If quiz has no auto-gradeable questions, score stays null until teacher grades manually
+        const score = autoTotalPoints > 0 ? Math.round((earnedPoints / allTotalPoints) * 100) : null;
+        const hasPendingManual = questions.some(q => !['select', 'multi-select'].includes(q.type));
+        await db.query(
+            'UPDATE quiz_submissions SET submitted_at = NOW(), score = $1 WHERE id = $2',
+            [score, submissionId]
+        );
+        res.json({ success: true, score, hasPendingManual });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get all submissions for a quiz (teacher)
+app.get('/api/quizzes/:id/submissions', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT qs.*, json_agg(json_build_object(
+                'id', qa.id, 'question_id', qa.question_id,
+                'answer_text', qa.answer_text, 'selected_options', qa.selected_options,
+                'file_url', qa.file_url, 'teacher_grade', qa.teacher_grade, 'teacher_feedback', qa.teacher_feedback
+             ) ORDER BY qa.question_id) FILTER (WHERE qa.id IS NOT NULL) AS answers
+             FROM quiz_submissions qs
+             LEFT JOIN quiz_answers qa ON qa.submission_id = qs.id
+             WHERE qs.quiz_id = $1
+             GROUP BY qs.id ORDER BY qs.submitted_at DESC NULLS LAST`,
+            [req.params.id]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Grade an answer (teacher) — also recalculates total submission score
+app.patch('/api/quiz-answers/:id/grade', async (req, res) => {
+    const { grade, feedback } = req.body;
+    try {
+        await db.query(
+            'UPDATE quiz_answers SET teacher_grade = $1, teacher_feedback = $2 WHERE id = $3',
+            [grade ?? null, feedback || null, req.params.id]
+        );
+        // Recalculate total submission score from all graded answers
+        const { rows: gradeData } = await db.query(
+            `SELECT qa.teacher_grade, qq.points
+             FROM quiz_answers qa
+             JOIN quiz_questions qq ON qq.id = qa.question_id
+             WHERE qa.submission_id = (SELECT submission_id FROM quiz_answers WHERE id = $1)`,
+            [req.params.id]
+        );
+        const allPts    = gradeData.reduce((s, r) => s + (Number(r.points) || 0), 0);
+        const earnedPts = gradeData.reduce((s, r) => s + (r.teacher_grade !== null ? Number(r.teacher_grade) : 0), 0);
+        const newScore  = allPts > 0 ? Math.round((earnedPts / allPts) * 100) : null;
+        await db.query(
+            `UPDATE quiz_submissions SET score = $1
+             WHERE id = (SELECT submission_id FROM quiz_answers WHERE id = $2)`,
+            [newScore, req.params.id]
+        );
+        res.json({ success: true, newScore });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get teacher's rooms for quiz room picker
+// Uses teacher_sessions (persistent) so rooms still appear after a session ends
+app.get('/api/teacher/:teacherId/rooms', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT room_id AS id, room_code AS code, title AS name
+             FROM teacher_sessions
+             WHERE created_by = $1
+             ORDER BY scheduled_at DESC`,
+            [req.params.teacherId]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────
 
 
