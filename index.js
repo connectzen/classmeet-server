@@ -534,6 +534,7 @@ app.post('/api/reject-user/:userId', async (req, res) => {
             'INSERT INTO rejected_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
             [userId]
         );
+        await db.query('DELETE FROM user_onboarding WHERE user_id = $1', [userId]);
         io.emit('admin:refresh', { type: 'pending' });
         res.json({ success: true });
     } catch (err) {
@@ -661,31 +662,6 @@ app.get('/api/admin/health', async (req, res) => {
         res.json({ status: 'ok', database: 'connected' });
     } catch (err) {
         res.status(503).json({ status: 'degraded', error: err.message });
-    }
-});
-
-// ── Admin backend stats (storage stub; admin only) ────────────────────────
-app.get('/api/admin/backend-stats', async (req, res) => {
-    const { adminId } = req.query;
-    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
-    try {
-        // InsForge plan/storage may be available via dashboard or MCP get-backend-metadata; when not in use, return stub.
-        const plan = null;
-        const storageTotal = null;
-        const storageUsed = null;
-        const storageRemaining = null;
-        const usageTrends = null;
-        const warnings = [];
-        res.json({
-            plan,
-            storageTotal,
-            storageUsed,
-            storageRemaining,
-            usageTrends: usageTrends ?? [],
-            warnings: warnings ?? [],
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
     }
 });
 
