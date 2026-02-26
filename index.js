@@ -35,6 +35,7 @@ const TEACHER_GRACE_MS = 30_000;
 
 // User ID to Socket ID mapping for direct messaging
 const userSockets = new Map();
+const onlineUserIds = new Set();
 
 // ── Cascade-delete all content produced by a user (called before Auth deletion) ──
 async function cascadeDeleteUserContent(userId) {
@@ -566,6 +567,7 @@ app.patch('/api/user-role/:userId', async (req, res) => {
         if (rowCount === 0) return res.status(404).json({ error: 'User not found' });
         io.emit('admin:refresh', { type: 'teachers' });
         io.emit('admin:refresh', { type: 'students' });
+        io.emit('admin:refresh', { type: 'members' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -583,6 +585,31 @@ app.get('/api/members', async (req, res) => {
         `);
         res.json(rows);
     } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/members', async (req, res) => {
+    const { name, email, tempPassword, adminId } = req.body;
+    if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
+    if (!name || !email || !tempPassword) return res.status(400).json({ error: 'Name, email, and tempPassword are required' });
+    try {
+        const { data: authData, error: authError } = await insforge.auth.signUp({
+            email,
+            password: tempPassword,
+            options: { data: { name } },
+        });
+        if (authError) throw authError;
+        await insforge.auth.signOut();
+        const userId = authData.user.id;
+        await db.query(
+            "INSERT INTO user_roles (user_id, role, name, email) VALUES ($1, 'member', $2, $3)",
+            [userId, name, email]
+        );
+        io.emit('admin:refresh', { type: 'members' });
+        res.json({ id: userId, name, email });
+    } catch (err) {
+        console.error('[REST] Error creating member:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -630,10 +657,20 @@ app.get('/api/admin/backend-stats', async (req, res) => {
     const { adminId } = req.query;
     if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
     try {
+        // InsForge plan/storage may be available via dashboard or MCP get-backend-metadata; when not in use, return stub.
+        const plan = null;
+        const storageTotal = null;
+        const storageUsed = null;
+        const storageRemaining = null;
+        const usageTrends = null;
+        const warnings = [];
         res.json({
-            storageUsed: null,
-            storageAvailable: null,
-            message: 'Storage metrics require InsForge Storage API; configure if needed.',
+            plan,
+            storageTotal,
+            storageUsed,
+            storageRemaining,
+            usageTrends: usageTrends ?? [],
+            warnings: warnings ?? [],
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1948,6 +1985,22 @@ app.get('/api/teacher/:teacherId/rooms', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/teacher/:teacherId/students', async (req, res) => {
+    const { teacherId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT user_id AS id, name, email
+             FROM user_roles
+             WHERE assigned_by = $1 AND role = 'student'
+             ORDER BY name`,
+            [teacherId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────
 
 
@@ -1976,8 +2029,13 @@ io.on('connection', (socket) => {
     socket.on('register-user', (userId) => {
         if (userId) {
             userSockets.set(userId, socket.id);
+            onlineUserIds.add(userId);
+            io.emit('presence:status', { userId, online: true });
             console.log(`[Socket] Registered user ${userId} to socket ${socket.id}`);
         }
+    });
+    socket.on('presence:subscribe', () => {
+        socket.emit('presence:list', Array.from(onlineUserIds));
     });
 
     // ── Join Room ──────────────────────────────────────────────────────────
@@ -2149,12 +2207,18 @@ io.on('connection', (socket) => {
 
     // ── Leave / Disconnect ─────────────────────────────────────────────────
     const handleLeave = (intentional = false) => {
-        // Remove from userSockets if registered
+        // Remove from userSockets and presence
+        let leavingUserId = null;
         for (const [userId, sId] of userSockets.entries()) {
             if (sId === socket.id) {
+                leavingUserId = userId;
                 userSockets.delete(userId);
                 break;
             }
+        }
+        if (leavingUserId) {
+            onlineUserIds.delete(leavingUserId);
+            io.emit('presence:status', { userId: leavingUserId, online: false });
         }
         const roomCode = roomManager.getParticipantRoom(socket.id);
         if (!roomCode) return;
