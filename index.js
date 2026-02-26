@@ -36,6 +36,7 @@ const TEACHER_GRACE_MS = 30_000;
 // User ID to Socket ID mapping for direct messaging
 const userSockets = new Map();
 const onlineUserIds = new Set();
+const lastSeenByUserId = new Map();
 
 // ── Cascade-delete all content produced by a user (called before Auth deletion) ──
 async function cascadeDeleteUserContent(userId) {
@@ -2057,6 +2058,9 @@ io.on('connection', (socket) => {
     });
     socket.on('presence:subscribe', () => {
         socket.emit('presence:list', Array.from(onlineUserIds));
+        const lastSeenObj = {};
+        for (const [uid, ts] of lastSeenByUserId.entries()) lastSeenObj[uid] = ts;
+        socket.emit('presence:state', { onlineIds: Array.from(onlineUserIds), lastSeen: lastSeenObj });
     });
 
     // ── Join Room ──────────────────────────────────────────────────────────
@@ -2243,7 +2247,9 @@ io.on('connection', (socket) => {
         }
         if (leavingUserId) {
             onlineUserIds.delete(leavingUserId);
-            io.emit('presence:status', { userId: leavingUserId, online: false });
+            const lastSeen = Date.now();
+            lastSeenByUserId.set(leavingUserId, lastSeen);
+            io.emit('presence:status', { userId: leavingUserId, online: false, lastSeen });
         }
         const roomCode = roomManager.getParticipantRoom(socket.id);
         if (!roomCode) return;
