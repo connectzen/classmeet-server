@@ -171,6 +171,7 @@ app.post('/api/teachers', async (req, res) => {
         );
 
         io.emit('admin:refresh', { type: 'teachers' });
+        io.emit('dashboard:data-changed');
         res.json({ id: userId, name, email });
     } catch (err) {
         console.error('[REST] Error creating teacher:', err);
@@ -207,6 +208,7 @@ app.delete('/api/teachers/:id', async (req, res) => {
         }
 
         io.emit('admin:refresh', { type: 'teachers' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -292,6 +294,7 @@ app.delete('/api/students/:id', async (req, res) => {
             }
         }
         io.emit('admin:refresh', { type: 'students' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -440,6 +443,7 @@ app.post('/api/onboarding', async (req, res) => {
             [userId, role, areasOfInterest || '', currentSituation || '', goals || '']
         );
         io.emit('admin:refresh', { type: 'pending' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true, role: 'pending' });
     } catch (err) {
         console.error('[onboarding]', err.message);
@@ -515,6 +519,7 @@ app.post('/api/claim-invite', async (req, res) => {
         );
         await db.query('UPDATE invite_links SET used_by = $1, used_at = NOW() WHERE token = $2', [userId, token]);
         io.emit('admin:refresh', { type: 'pending' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true, role });
     } catch (err) {
         console.error('[claim-invite]', err.message);
@@ -537,6 +542,7 @@ app.post('/api/reject-user/:userId', async (req, res) => {
         );
         await db.query('DELETE FROM user_onboarding WHERE user_id = $1', [userId]);
         io.emit('admin:refresh', { type: 'pending' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -561,6 +567,7 @@ app.post('/api/approve-user/:userId', async (req, res) => {
             [userId, assignedRole, name || '', email || '']
         );
         io.emit('admin:refresh', { type: 'pending' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -582,6 +589,7 @@ app.patch('/api/user-role/:userId', async (req, res) => {
         io.emit('admin:refresh', { type: 'teachers' });
         io.emit('admin:refresh', { type: 'students' });
         io.emit('admin:refresh', { type: 'members' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -621,6 +629,7 @@ app.post('/api/members', async (req, res) => {
             [userId, name, email]
         );
         io.emit('admin:refresh', { type: 'members' });
+        io.emit('dashboard:data-changed');
         res.json({ id: userId, name, email });
     } catch (err) {
         console.error('[REST] Error creating member:', err);
@@ -740,6 +749,7 @@ app.patch('/api/profile/sync-name', async (req, res) => {
         // Emit refresh so dashboards show updated name immediately
         io.emit('admin:refresh', { type: 'students' });
         io.emit('admin:refresh', { type: 'teachers' });
+        io.emit('dashboard:data-changed');
         res.json({ success: true, updated: rowCount > 0 });
     } catch (err) {
         console.error('[profile/sync-name]', err.message);
@@ -1419,6 +1429,7 @@ app.post('/api/teacher/sessions', async (req, res) => {
 
         roomManager.setMaxParticipants(code, Number(maxParticipants));
         io.emit('teacher:session-created', { sessionId });
+        io.emit('dashboard:data-changed');
         res.json({ id: sessionId, code, roomId, title });
     } catch (err) {
         console.error('[teacher/sessions POST]', err.message);
@@ -1522,6 +1533,7 @@ app.delete('/api/teacher/sessions/:sessionId', async (req, res) => {
         }
 
         io.emit('teacher:session-ended', { sessionId });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1558,6 +1570,7 @@ app.put('/api/teacher/sessions/:sessionId', async (req, res) => {
         }
 
         io.emit('teacher:session-updated', { sessionId });
+        io.emit('dashboard:data-changed');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
