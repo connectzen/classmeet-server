@@ -33,6 +33,9 @@ const io = new Server(server, {
 const teacherGraceTimers = new Map();
 const TEACHER_GRACE_MS = 30_000;
 
+// Room quiz state: roomCode -> { activeQuizId, quiz, submissions: [{ submissionId, studentId, studentName, score }] }
+const roomQuizState = new Map();
+
 // User ID to Socket ID mapping for direct messaging
 const userSockets = new Map();
 const onlineUserIds = new Set();
@@ -389,15 +392,10 @@ app.get('/api/pending-users', async (req, res) => {
         // Get all user_ids already assigned a role
         const { rows: roleRows } = await db.query('SELECT user_id FROM user_roles');
         const assignedIds = new Set(roleRows.map(r => r.user_id));
-        let rejectedIds = new Set();
-        try {
-            const { rows: rej } = await db.query('SELECT user_id FROM rejected_users');
-            rejectedIds = new Set(rej.map(r => r.user_id));
-        } catch (e) { /* table may not exist yet */ }
 
-        // Filter out admins, assigned, and rejected users
+        // Filter out admins and assigned users (rejected users are deleted, not stored)
         const pending = authUsers
-            .filter(u => !ADMIN_USER_IDS.has(u.id) && !assignedIds.has(u.id) && !rejectedIds.has(u.id))
+            .filter(u => !ADMIN_USER_IDS.has(u.id) && !assignedIds.has(u.id))
             .map(u => ({
                 id:         u.id,
                 name:       u.profile?.name || u.name || '',
@@ -570,20 +568,40 @@ app.post('/api/claim-invite', async (req, res) => {
     }
 });
 
-// ── Reject a pending user (admin only) ────────────────────────────────────
+// ── Reject a pending user (admin only) — DELETE user entirely from backend ──
 app.post('/api/reject-user/:userId', async (req, res) => {
     const { userId } = req.params;
     const { adminId } = req.body;
     if (!adminId || !(await isAdminUser(adminId))) return res.status(403).json({ error: 'Admin required' });
     try {
-        await db.query(
-            'CREATE TABLE IF NOT EXISTS rejected_users (user_id UUID PRIMARY KEY, rejected_at TIMESTAMPTZ DEFAULT NOW())'
-        );
-        await db.query(
-            'INSERT INTO rejected_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
-            [userId]
-        );
+        // 1. Cascade-delete any chat content (storage files, tombstone messages)
+        await cascadeDeleteUserContent(userId);
+
+        // 2. Delete from our database (user_onboarding, invite claims, user_roles, enrollments, quiz, chat)
         await db.query('DELETE FROM user_onboarding WHERE user_id = $1', [userId]);
+        await db.query('DELETE FROM invite_link_claims WHERE user_id = $1', [userId]);
+        await db.query('UPDATE invite_links SET used_by = NULL, used_at = NULL WHERE used_by = $1', [userId]);
+        await db.query('DELETE FROM student_enrollments WHERE user_id = $1', [userId]);
+        await db.query('DELETE FROM quiz_submissions WHERE student_id = $1', [userId]);
+        await db.query('DELETE FROM chat_participants WHERE user_id = $1', [userId]);
+        await db.query('DELETE FROM user_roles WHERE user_id = $1', [userId]);
+
+        // 3. Delete from InsForge auth (removes user from auth system entirely)
+        const baseUrl = process.env.INSFORGE_BASE_URL;
+        const apiKey  = process.env.INSFORGE_API_KEY;
+        if (baseUrl && apiKey) {
+            try {
+                const authRes = await fetch(`${baseUrl}/api/auth/users`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userIds: [userId] }),
+                });
+                if (!authRes.ok) console.warn('[reject] Auth delete failed:', await authRes.text());
+            } catch (authErr) {
+                console.warn('[reject] Could not delete auth user:', authErr.message);
+            }
+        }
+
         io.emit('admin:refresh', { type: 'pending' });
         io.emit('dashboard:data-changed');
         res.json({ success: true });
@@ -2367,7 +2385,16 @@ io.on('connection', (socket) => {
                 }
             }
 
-            callback({ success: true, roomId, roomName: roomName || roomCode, existingParticipants, currentSpotlight, teacherPresent });
+            const quizState = roomQuizState.get(roomCode);
+            callback({
+                success: true,
+                roomId,
+                roomName: roomName || roomCode,
+                existingParticipants,
+                currentSpotlight,
+                teacherPresent,
+                roomQuiz: quizState ? { quizId: quizState.activeQuizId, quiz: quizState.quiz } : null,
+            });
         } catch (err) {
             console.error('[join-room] error:', err.message);
             callback({ error: err.message });
@@ -2412,7 +2439,63 @@ io.on('connection', (socket) => {
             clearTimeout(teacherGraceTimers.get(roomCode));
             teacherGraceTimers.delete(roomCode);
         }
+        roomQuizState.delete(roomCode);
         await endRoom(roomCode, roomId);
+    });
+
+    // ── Room Quiz (teacher starts/stops, students submit, teacher reveals) ──
+    socket.on('room-quiz-start', async ({ roomCode, roomId, quizId }) => {
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (!info || info.role !== 'teacher') return;
+        try {
+            const { rows: qRows } = await db.query('SELECT * FROM quizzes WHERE id = $1 AND status = $2', [quizId, 'published']);
+            if (!qRows.length) return socket.emit('room:quiz-error', { error: 'Quiz not found or not published' });
+            const quiz = qRows[0];
+            const { rows: all } = await db.query(
+                `SELECT id, quiz_id, type, question_text, options, video_url, order_index, points, parent_question_id
+                 FROM quiz_questions WHERE quiz_id = $1 ORDER BY order_index ASC`,
+                [quizId]
+            );
+            const topLevel = all.filter(q => !q.parent_question_id);
+            const childrenByParent = {};
+            all.filter(q => q.parent_question_id).forEach(q => {
+                if (!childrenByParent[q.parent_question_id]) childrenByParent[q.parent_question_id] = [];
+                childrenByParent[q.parent_question_id].push(q);
+            });
+            const questions = topLevel.map(q => ({ ...q, children: childrenByParent[q.id] || [] }));
+            const quizWithQuestions = { ...quiz, questions };
+            roomQuizState.set(roomCode, { activeQuizId: quizId, quiz: quizWithQuestions, submissions: [] });
+            io.to(roomCode).emit('room:quiz-active', { quizId, quiz: quizWithQuestions });
+            socket.emit('room:quiz-active', { quizId, quiz: quizWithQuestions });
+        } catch (err) {
+            console.error('[room-quiz-start]', err);
+            socket.emit('room:quiz-error', { error: err.message });
+        }
+    });
+
+    socket.on('room-quiz-stop', ({ roomCode }) => {
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (!info || info.role !== 'teacher') return;
+        roomQuizState.delete(roomCode);
+        io.to(roomCode).emit('room:quiz-inactive');
+        socket.emit('room:quiz-inactive');
+    });
+
+    socket.on('room-quiz-submit', ({ roomCode, submissionId, quizId, studentId, studentName, score }) => {
+        const state = roomQuizState.get(roomCode);
+        if (!state || state.activeQuizId !== quizId) return;
+        const sub = { submissionId, studentId, studentName, score };
+        state.submissions.push(sub);
+        const teacherSocketId = roomManager.getTeacherSocketId(roomCode);
+        if (teacherSocketId) {
+            io.to(teacherSocketId).emit('room:quiz-submission', { ...sub, submissions: state.submissions });
+        }
+    });
+
+    socket.on('room-quiz-reveal', ({ roomCode, type, submissionId, data }) => {
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (!info || info.role !== 'teacher') return;
+        io.to(roomCode).emit('room:quiz-revealed', { type, submissionId, data });
     });
 
     // ── Chat System ────────────────────────────────────────────────────────
@@ -2497,6 +2580,7 @@ io.on('connection', (socket) => {
         const { wasTeacher, role } = roomManager.removeParticipant(socket.id);
         if (role === 'guest') decrementGuestCount();
         socket.to(roomCode).emit('participant-left', { socketId: socket.id });
+        if (roomManager.getParticipantCount(roomCode) === 0) roomQuizState.delete(roomCode);
         console.log(`[-] ${info?.name || socket.id} left ${roomCode}`);
 
         // If the spotlighted person left, fall back to teacher (or clear spotlight)
@@ -2757,6 +2841,12 @@ server.listen(PORT, async () => {
         console.log('[migrate] lessons lesson_type, video_url, audio_url ready');
     } catch (err) {
         console.warn('[migrate] lessons type:', err.message);
+    }
+    try {
+        await db.query('DROP TABLE IF EXISTS rejected_users');
+        console.log('[migrate] rejected_users table removed (reject = delete)');
+    } catch (err) {
+        console.warn('[migrate] drop rejected_users:', err.message);
     }
     console.log(`🚀 ClassMeet server running on port ${PORT}`);
     console.log(`   InsForge: ${process.env.INSFORGE_BASE_URL}`);
