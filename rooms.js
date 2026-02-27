@@ -86,6 +86,15 @@ class RoomManager {
         }
         return null;
     }
+
+    getSocketIdByUserId(code, userId) {
+        const room = this.rooms.get(code);
+        if (!room) return null;
+        for (const [socketId, info] of room.participants) {
+            if (info.userId === userId) return socketId;
+        }
+        return null;
+    }
 }
 
 module.exports = new RoomManager();

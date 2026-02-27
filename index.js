@@ -2091,7 +2091,15 @@ app.get('/api/quizzes/:id/my-submission', async (req, res) => {
         );
         if (!subRows.length) return res.json(null);
         const { rows: answers } = await db.query(
-            'SELECT * FROM quiz_answers WHERE submission_id = $1',
+            `SELECT qa.*,
+                    json_build_object(
+                        'id', qq.id, 'question_text', qq.question_text, 'type', qq.type,
+                        'options', qq.options, 'correct_answers', qq.correct_answers, 'points', qq.points
+                    ) AS question
+             FROM quiz_answers qa
+             JOIN quiz_questions qq ON qq.id = qa.question_id
+             WHERE qa.submission_id = $1
+             ORDER BY qq.order_index ASC`,
             [subRows[0].id]
         );
         res.json({ ...subRows[0], answers });
@@ -2484,7 +2492,7 @@ io.on('connection', (socket) => {
     socket.on('room-quiz-submit', ({ roomCode, submissionId, quizId, studentId, studentName, score }) => {
         const state = roomQuizState.get(roomCode);
         if (!state || state.activeQuizId !== quizId) return;
-        const sub = { submissionId, studentId, studentName, score };
+        const sub = { submissionId, studentId, studentName, score, socketId: socket.id };
         state.submissions.push(sub);
         const teacherSocketId = roomManager.getTeacherSocketId(roomCode);
         if (teacherSocketId) {
@@ -2495,7 +2503,27 @@ io.on('connection', (socket) => {
     socket.on('room-quiz-reveal', ({ roomCode, type, submissionId, data }) => {
         const info = roomManager.getParticipantInfo(socket.id);
         if (!info || info.role !== 'teacher') return;
-        io.to(roomCode).emit('room:quiz-revealed', { type, submissionId, data });
+
+        if (type === 'individual' && data?.studentId) {
+            // Find the student's socket from quiz state submissions or userSockets
+            const state = roomQuizState.get(roomCode);
+            let studentSocketId = null;
+            if (state) {
+                const sub = state.submissions.find(s => s.studentId === data.studentId);
+                if (sub && sub.socketId) studentSocketId = sub.socketId;
+            }
+            if (!studentSocketId) studentSocketId = userSockets.get(data.studentId);
+            if (!studentSocketId) studentSocketId = roomManager.getSocketIdByUserId(roomCode, data.studentId);
+
+            if (studentSocketId) {
+                io.to(studentSocketId).emit('room:quiz-revealed', { type: 'individual', submissionId, data });
+            }
+            // Notify teacher that this student was revealed
+            socket.emit('room:quiz-student-revealed', { submissionId, studentId: data.studentId });
+        } else {
+            // Broadcast final results to everyone
+            io.to(roomCode).emit('room:quiz-revealed', { type, submissionId, data });
+        }
     });
 
     // ── Chat System ────────────────────────────────────────────────────────
