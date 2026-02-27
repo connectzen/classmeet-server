@@ -2094,7 +2094,7 @@ app.get('/api/teacher/:teacherId/students', async (req, res) => {
     const { teacherId } = req.params;
     try {
         const { rows } = await db.query(
-            `SELECT user_id AS id, name, email
+            `SELECT user_id AS id, name, email, avatar_url
              FROM user_roles
              WHERE assigned_by = $1 AND role = 'student'
              ORDER BY name`,
