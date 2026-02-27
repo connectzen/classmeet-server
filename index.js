@@ -132,7 +132,7 @@ app.get('/api/user-role/:userId', async (req, res) => {
 app.get('/api/teachers', async (req, res) => {
     try {
         const { rows } = await db.query(`
-            SELECT user_id, name, email, created_at
+            SELECT user_id, name, email, created_at, avatar_url
             FROM user_roles
             WHERE role = 'teacher'
             ORDER BY created_at DESC
@@ -218,13 +218,13 @@ app.delete('/api/teachers/:id', async (req, res) => {
 app.get('/api/students', async (req, res) => {
     try {
         const { rows } = await db.query(`
-            SELECT ur.user_id, ur.name, ur.email, ur.created_at,
+            SELECT ur.user_id, ur.name, ur.email, ur.created_at, ur.avatar_url,
                    COUNT(se.id)::int AS enrollment_count,
                    COALESCE(ur.chat_allowed, false) AS chat_allowed
             FROM user_roles ur
             LEFT JOIN student_enrollments se ON se.user_id = ur.user_id::text
             WHERE ur.role = 'student'
-            GROUP BY ur.user_id, ur.name, ur.email, ur.created_at, ur.chat_allowed
+            GROUP BY ur.user_id, ur.name, ur.email, ur.created_at, ur.avatar_url, ur.chat_allowed
             ORDER BY ur.created_at DESC
         `);
         res.json(rows);
@@ -303,7 +303,7 @@ app.delete('/api/students/:id', async (req, res) => {
 
 app.get('/api/all-users', async (req, res) => {
     try {
-        const { rows } = await db.query("SELECT user_id as id, name, email, role FROM user_roles");
+        const { rows } = await db.query("SELECT user_id as id, name, email, role, avatar_url FROM user_roles");
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -323,25 +323,25 @@ app.get('/api/chat/partners/:userId', async (req, res) => {
         const isAdmin = await isAdminUser(userId);
 
         if (isAdmin) {
-            const { rows } = await db.query("SELECT user_id as id, name, email, role FROM user_roles ORDER BY name");
+            const { rows } = await db.query("SELECT user_id as id, name, email, role, avatar_url FROM user_roles ORDER BY name");
             return res.json(rows);
         }
         if (myRole === 'member') {
             const { rows } = await db.query(
-                "SELECT user_id as id, name, email, role FROM user_roles WHERE assigned_by = $1 ORDER BY name",
+                "SELECT user_id as id, name, email, role, avatar_url FROM user_roles WHERE assigned_by = $1 ORDER BY name",
                 [userId]
             );
             return res.json(rows);
         }
         if (myRole === 'teacher') {
             const { rows: myStudents } = await db.query(
-                "SELECT user_id as id, name, email, role FROM user_roles WHERE assigned_by = $1 AND role = 'student'",
+                "SELECT user_id as id, name, email, role, avatar_url FROM user_roles WHERE assigned_by = $1 AND role = 'student'",
                 [userId]
             );
             const partnerIds = myStudents.map(r => r.id);
             if (myAssignedBy) {
                 const { rows: memberRow } = await db.query(
-                    "SELECT user_id as id, name, email, role FROM user_roles WHERE user_id = $1",
+                    "SELECT user_id as id, name, email, role, avatar_url FROM user_roles WHERE user_id = $1",
                     [myAssignedBy]
                 );
                 if (memberRow.length && !partnerIds.includes(memberRow[0].id)) partnerIds.push(memberRow[0].id);
@@ -349,7 +349,7 @@ app.get('/api/chat/partners/:userId', async (req, res) => {
             if (partnerIds.length === 0) return res.json([]);
             const placeholders = partnerIds.map((_, i) => `$${i + 1}`).join(',');
             const { rows } = await db.query(
-                `SELECT user_id as id, name, email, role FROM user_roles WHERE user_id IN (${placeholders}) ORDER BY name`,
+                `SELECT user_id as id, name, email, role, avatar_url FROM user_roles WHERE user_id IN (${placeholders}) ORDER BY name`,
                 partnerIds
             );
             return res.json(rows);
@@ -357,7 +357,7 @@ app.get('/api/chat/partners/:userId', async (req, res) => {
         if (myRole === 'student') {
             if (!myAssignedBy) return res.json([]);
             const { rows } = await db.query(
-                "SELECT user_id as id, name, email, role FROM user_roles WHERE user_id = $1",
+                "SELECT user_id as id, name, email, role, avatar_url FROM user_roles WHERE user_id = $1",
                 [myAssignedBy]
             );
             return res.json(rows);
@@ -600,7 +600,7 @@ app.patch('/api/user-role/:userId', async (req, res) => {
 app.get('/api/members', async (req, res) => {
     try {
         const { rows } = await db.query(`
-            SELECT user_id, name, email, created_at
+            SELECT user_id, name, email, created_at, avatar_url
             FROM user_roles
             WHERE role = 'member'
             ORDER BY created_at DESC
@@ -753,7 +753,12 @@ app.post('/api/profile/upload-avatar', upload.single('file'), async (req, res) =
             headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ filename, contentType: req.file.mimetype, size: req.file.size }),
         });
-        if (!stratRes.ok) return res.status(500).json({ error: 'Strategy failed: ' + await stratRes.text() });
+        if (!stratRes.ok) {
+            const errBody = await stratRes.text();
+            let errMsg;
+            try { const j = JSON.parse(errBody); errMsg = j.message || j.error || errBody; } catch (_) { errMsg = errBody; }
+            return res.status(500).json({ error: 'Strategy failed: ' + (errMsg || stratRes.statusText) });
+        }
         const strategy = await stratRes.json();
 
         const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
@@ -768,14 +773,20 @@ app.post('/api/profile/upload-avatar', upload.single('file'), async (req, res) =
                 headers: { 'Authorization': `Bearer ${apiKey}` },
                 body: form,
             });
-            if (!upRes.ok) return res.status(500).json({ error: 'Upload failed: ' + await upRes.text() });
+            if (!upRes.ok) {
+                const errBody = await upRes.text();
+                return res.status(500).json({ error: 'Upload failed: ' + (errBody || upRes.statusText) });
+            }
             publicUrl = uploadUrl;
         } else {
             const form = new FormData();
             for (const [k, v] of Object.entries(strategy.fields || {})) form.append(k, String(v));
             form.append('file', fileBlob, req.file.originalname);
             const upRes = await fetch(strategy.uploadUrl, { method: 'POST', body: form });
-            if (!upRes.ok) return res.status(500).json({ error: 'S3 upload failed: ' + await upRes.text() });
+            if (!upRes.ok) {
+                const errBody = await upRes.text();
+                return res.status(500).json({ error: 'S3 upload failed: ' + (errBody || upRes.statusText) });
+            }
             if (strategy.confirmRequired && strategy.confirmUrl) {
                 const confirmUrl = strategy.confirmUrl.startsWith('http') ? strategy.confirmUrl : `${baseUrl}${strategy.confirmUrl}`;
                 await fetch(confirmUrl, {
@@ -790,21 +801,21 @@ app.post('/api/profile/upload-avatar', upload.single('file'), async (req, res) =
         res.json({ url: publicUrl, name: req.file.originalname, type: req.file.mimetype });
     } catch (err) {
         console.error('[profile/upload-avatar]', err.message);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message || 'Upload failed' });
     }
 });
 
-// ── Sync profile name from InsForge to user_roles ────────────────────────
+// ── Sync profile name and avatar_url from InsForge to user_roles ───────────
 // Called by the client after insforge.auth.setProfile() succeeds
 app.patch('/api/profile/sync-name', async (req, res) => {
-    const { userId, name } = req.body;
+    const { userId, name, avatar_url } = req.body;
     if (!userId || !name) return res.status(400).json({ error: 'userId and name are required' });
     try {
         const { rowCount } = await db.query(
-            `UPDATE user_roles SET name = $1 WHERE user_id = $2`,
-            [name.trim(), userId]
+            `UPDATE user_roles SET name = $1, avatar_url = $2 WHERE user_id = $3`,
+            [name.trim(), avatar_url || null, userId]
         );
-        // Emit refresh so dashboards show updated name immediately
+        // Emit refresh so dashboards show updated name/avatar immediately
         io.emit('admin:refresh', { type: 'students' });
         io.emit('admin:refresh', { type: 'teachers' });
         io.emit('dashboard:data-changed');
@@ -1056,7 +1067,7 @@ app.get('/api/chat/conversations/:userId', async (req, res) => {
         const enriched = await Promise.all(convRows.map(async (conv) => {
             if (conv.type === 'dm') {
                 const { rows: others } = await db.query(
-                    `SELECT cp.user_id, COALESCE(ur.name, cp.user_name) AS user_name, COALESCE(ur.role, cp.user_role) AS user_role
+                    `SELECT cp.user_id, COALESCE(ur.name, cp.user_name) AS user_name, COALESCE(ur.role, cp.user_role) AS user_role, ur.avatar_url
                      FROM chat_participants cp
                      LEFT JOIN user_roles ur ON ur.user_id = cp.user_id
                      WHERE cp.conversation_id = $1 AND cp.user_id != $2 LIMIT 1`,
@@ -2387,6 +2398,12 @@ server.listen(PORT, async () => {
         console.log('[migrate] user_roles.chat_allowed ready');
     } catch (err) {
         console.warn('[migrate] chat_allowed column:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS avatar_url TEXT`);
+        console.log('[migrate] user_roles.avatar_url ready');
+    } catch (err) {
+        console.warn('[migrate] avatar_url column:', err.message);
     }
     try {
         await db.query(`ALTER TABLE teacher_sessions ADD COLUMN IF NOT EXISTS session_image_url TEXT`);
