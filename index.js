@@ -2500,12 +2500,34 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('room-quiz-reveal', ({ roomCode, type, submissionId, data }) => {
+    socket.on('room-quiz-reveal', async ({ roomCode, type, submissionId, data }) => {
         const info = roomManager.getParticipantInfo(socket.id);
         if (!info || info.role !== 'teacher') return;
 
+        // Helper: fetch actual score from DB for a submission
+        async function getDbScore(subId) {
+            try {
+                const { rows } = await db.query(
+                    'SELECT score, teacher_final_score_override, teacher_overall_feedback, student_name FROM quiz_submissions WHERE id = $1',
+                    [subId]
+                );
+                const sub = rows[0];
+                if (!sub) return null;
+                const effectiveScore = sub.teacher_final_score_override != null
+                    ? Number(sub.teacher_final_score_override)
+                    : (sub.score != null ? Number(sub.score) : null);
+                return { score: effectiveScore, comment: sub.teacher_overall_feedback || null, studentName: sub.student_name };
+            } catch { return null; }
+        }
+
         if (type === 'individual' && data?.studentId) {
-            // Find the student's socket from quiz state submissions or userSockets
+            // Private reveal to a single student
+            const dbData = submissionId ? await getDbScore(submissionId) : null;
+            const revealData = {
+                ...data,
+                ...(dbData ? { score: dbData.score, comment: dbData.comment, studentName: data?.studentName || dbData.studentName } : {}),
+            };
+
             const state = roomQuizState.get(roomCode);
             let studentSocketId = null;
             if (state) {
@@ -2516,12 +2538,22 @@ io.on('connection', (socket) => {
             if (!studentSocketId) studentSocketId = roomManager.getSocketIdByUserId(roomCode, data.studentId);
 
             if (studentSocketId) {
-                io.to(studentSocketId).emit('room:quiz-revealed', { type: 'individual', submissionId, data });
+                io.to(studentSocketId).emit('room:quiz-revealed', { type: 'individual', submissionId, data: revealData });
             }
-            // Notify teacher that this student was revealed
             socket.emit('room:quiz-student-revealed', { submissionId, studentId: data.studentId });
+
+        } else if (type === 'class-reveal' && submissionId) {
+            // Broadcast one student's result to the ENTIRE room (dramatic reveal)
+            const dbData = await getDbScore(submissionId);
+            const revealData = {
+                ...data,
+                ...(dbData ? { score: dbData.score, comment: dbData.comment, studentName: data?.studentName || dbData.studentName } : {}),
+            };
+            io.to(roomCode).emit('room:quiz-revealed', { type: 'class-reveal', submissionId, data: revealData });
+            socket.emit('room:quiz-student-revealed', { submissionId, studentId: data?.studentId });
+
         } else {
-            // Broadcast final results to everyone
+            // Legacy final broadcast
             io.to(roomCode).emit('room:quiz-revealed', { type, submissionId, data });
         }
     });
