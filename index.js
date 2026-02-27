@@ -472,9 +472,9 @@ app.post('/api/invite-links', async (req, res) => {
         } else {
             return res.status(403).json({ error: 'Only Members and Teachers can create invite links' });
         }
-        // Create-or-return: reuse existing unused link if one exists
+        // Create-or-return: reuse existing link if one exists (links are unlimited use)
         const { rows: existing } = await db.query(
-            'SELECT id, token FROM invite_links WHERE created_by = $1 AND role = $2 AND used_by IS NULL LIMIT 1',
+            'SELECT id, token FROM invite_links WHERE created_by = $1 AND role = $2 LIMIT 1',
             [createdBy, allowedRole]
         );
         const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
@@ -509,12 +509,12 @@ app.patch('/api/invite-links/regenerate', async (req, res) => {
             return res.status(403).json({ error: 'Only Members and Teachers can regenerate invite links' });
         }
         const { rows } = await db.query(
-            'SELECT id FROM invite_links WHERE created_by = $1 AND role = $2 AND used_by IS NULL ORDER BY created_at DESC LIMIT 1',
+            'SELECT id FROM invite_links WHERE created_by = $1 AND role = $2 ORDER BY created_at DESC LIMIT 1',
             [createdBy, allowedRole]
         );
-        if (rows.length === 0) return res.status(404).json({ error: 'No unused invite link to regenerate' });
+        if (rows.length === 0) return res.status(404).json({ error: 'No invite link to regenerate' });
         const newToken = crypto.randomBytes(24).toString('hex');
-        await db.query('UPDATE invite_links SET token = $1 WHERE id = $2 AND used_by IS NULL', [newToken, rows[0].id]);
+        await db.query('UPDATE invite_links SET token = $1 WHERE id = $2', [newToken, rows[0].id]);
         const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
         const url = `${baseUrl.replace(/\/$/, '')}?invite=${newToken}`;
         res.json({ url, token: newToken });
@@ -529,12 +529,14 @@ app.get('/api/invite-links', async (req, res) => {
     if (!createdBy) return res.status(400).json({ error: 'createdBy is required' });
     try {
         const { rows } = await db.query(
-            'SELECT id, token, role, created_at FROM invite_links WHERE created_by = $1 AND used_by IS NULL ORDER BY created_at DESC',
+            `SELECT il.id, il.token, il.role, il.created_at,
+              (SELECT COUNT(*)::int FROM invite_link_claims WHERE invite_link_id = il.id) AS claim_count
+             FROM invite_links il WHERE il.created_by = $1 ORDER BY il.created_at DESC`,
             [createdBy]
         );
         const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
         const base = baseUrl.replace(/\/$/, '');
-        res.json(rows.map(r => ({ ...r, url: `${base}?invite=${r.token}` })));
+        res.json(rows.map(r => ({ ...r, url: `${base}?invite=${r.token}`, claim_count: r.claim_count || 0 })));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -545,17 +547,20 @@ app.post('/api/claim-invite', async (req, res) => {
     if (!token || !userId) return res.status(400).json({ error: 'token and userId are required' });
     try {
         const { rows } = await db.query(
-            'SELECT id, role, created_by FROM invite_links WHERE token = $1 AND used_by IS NULL',
+            'SELECT id, role, created_by FROM invite_links WHERE token = $1',
             [token]
         );
-        if (rows.length === 0) return res.status(404).json({ error: 'Invalid or already used invite link' });
-        const { role, created_by: assignedBy } = rows[0];
+        if (rows.length === 0) return res.status(404).json({ error: 'Invalid invite link' });
+        const { id: inviteLinkId, role, created_by: assignedBy } = rows[0];
         await db.query(
             `INSERT INTO user_roles (user_id, role, name, email, assigned_by) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name, email = EXCLUDED.email, assigned_by = EXCLUDED.assigned_by`,
             [userId, role, name || '', email || '', assignedBy]
         );
-        await db.query('UPDATE invite_links SET used_by = $1, used_at = NOW() WHERE token = $2', [userId, token]);
+        await db.query(
+            'INSERT INTO invite_link_claims (invite_link_id, user_id) VALUES ($1, $2) ON CONFLICT (invite_link_id, user_id) DO NOTHING',
+            [inviteLinkId, userId]
+        );
         io.emit('admin:refresh', { type: 'pending' });
         io.emit('dashboard:data-changed');
         res.json({ success: true, role });
@@ -2686,6 +2691,21 @@ server.listen(PORT, async () => {
         console.log('[migrate] user_onboarding, invite_links, guest_rooms, courses ready');
     } catch (err) {
         console.warn('[migrate] role system tables:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS invite_link_claims (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                invite_link_id  UUID NOT NULL REFERENCES invite_links(id) ON DELETE CASCADE,
+                user_id         UUID NOT NULL,
+                claimed_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(invite_link_id, user_id)
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_invite_link_claims_invite_link_id ON invite_link_claims(invite_link_id)`);
+        console.log('[migrate] invite_link_claims ready');
+    } catch (err) {
+        console.warn('[migrate] invite_link_claims:', err.message);
     }
     try {
         await db.query(`ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT`);

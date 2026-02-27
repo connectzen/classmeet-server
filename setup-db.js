@@ -152,6 +152,14 @@ async function setupDatabase() {
             created_at  TIMESTAMPTZ DEFAULT NOW()
         )`,
         `CREATE INDEX IF NOT EXISTS idx_invite_links_created_by ON invite_links(created_by)`,
+        `CREATE TABLE IF NOT EXISTS invite_link_claims (
+            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            invite_link_id  UUID NOT NULL REFERENCES invite_links(id) ON DELETE CASCADE,
+            user_id         UUID NOT NULL,
+            claimed_at      TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(invite_link_id, user_id)
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_invite_link_claims_invite_link_id ON invite_link_claims(invite_link_id)`,
 
         // ── Guest rooms ────────────────────────────────────────────────────
         `CREATE TABLE IF NOT EXISTS guest_rooms (
