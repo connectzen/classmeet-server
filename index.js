@@ -1798,20 +1798,21 @@ app.get('/api/courses/:id/lessons', async (req, res) => {
 });
 
 app.post('/api/courses/:id/lessons', async (req, res) => {
-    const { title, content, orderIndex } = req.body;
+    const { title, content, orderIndex, lessonType, videoUrl, audioUrl } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
     try {
         const order = orderIndex != null ? orderIndex : 0;
+        const type = ['text', 'video', 'audio'].includes(lessonType) ? lessonType : 'text';
         const { rows } = await db.query(
-            'INSERT INTO lessons (course_id, title, content, order_index) VALUES ($1, $2, $3, $4) RETURNING *',
-            [req.params.id, title.trim(), content || null, order]
+            'INSERT INTO lessons (course_id, title, content, order_index, lesson_type, video_url, audio_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [req.params.id, title.trim(), content || null, order, type, videoUrl || null, audioUrl || null]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.patch('/api/lessons/:id', async (req, res) => {
-    const { title, content, orderIndex } = req.body;
+    const { title, content, orderIndex, lessonType, videoUrl, audioUrl } = req.body;
     try {
         const updates = [];
         const params = [];
@@ -1819,6 +1820,9 @@ app.patch('/api/lessons/:id', async (req, res) => {
         if (title !== undefined) { updates.push(`title = $${i++}`); params.push(title); }
         if (content !== undefined) { updates.push(`content = $${i++}`); params.push(content); }
         if (orderIndex !== undefined) { updates.push(`order_index = $${i++}`); params.push(orderIndex); }
+        if (lessonType !== undefined) { updates.push(`lesson_type = $${i++}`); params.push(['text', 'video', 'audio'].includes(lessonType) ? lessonType : 'text'); }
+        if (videoUrl !== undefined) { updates.push(`video_url = $${i++}`); params.push(videoUrl); }
+        if (audioUrl !== undefined) { updates.push(`audio_url = $${i++}`); params.push(audioUrl); }
         if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
         params.push(req.params.id);
         const { rows } = await db.query(
@@ -1840,7 +1844,8 @@ app.delete('/api/lessons/:id', async (req, res) => {
 app.post('/api/quizzes', async (req, res) => {
     const { title, roomId, courseId, timeLimitMinutes, createdBy } = req.body;
     if (!title || !createdBy) return res.status(400).json({ error: 'title and createdBy required' });
-    const room = roomId || null;
+    if (!roomId && !courseId) return res.status(400).json({ error: 'Select at least a room or course' });
+    const room = roomId || (courseId ? `course-only-${courseId}` : 'placeholder');
     try {
         const creatorRole = await getRoleForUser(createdBy);
         if (creatorRole !== 'member' && creatorRole !== 'teacher' && creatorRole !== 'admin') {
@@ -1849,7 +1854,7 @@ app.post('/api/quizzes', async (req, res) => {
         const { rows } = await db.query(
             `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes, course_id)
              VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [title.trim(), room || (courseId || 'placeholder'), createdBy, timeLimitMinutes || null, courseId || null]
+            [title.trim(), room, createdBy, timeLimitMinutes || null, courseId || null]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1903,8 +1908,8 @@ app.get('/api/quizzes', async (req, res) => {
             params.push(String(studentId));
             const sp = params.length;
             subJoin   = `LEFT JOIN quiz_submissions sub ON sub.quiz_id = q.id AND sub.student_id = $${sp}`;
-            subSelect = `, sub.submitted_at AS submitted_at, sub.score AS my_score`;
-            subGroup  = `, sub.submitted_at, sub.score`;
+            subSelect = `, sub.submitted_at AS submitted_at, COALESCE(sub.teacher_final_score_override, sub.score) AS my_score`;
+            subGroup  = `, sub.submitted_at, sub.score, sub.teacher_final_score_override`;
         }
         const { rows } = await db.query(
             `SELECT q.*, COUNT(qq.id)::int AS question_count${subSelect}
@@ -1919,19 +1924,29 @@ app.get('/api/quizzes', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Get one quiz with questions
+// Get one quiz with questions (nested: parent video questions with children)
 app.get('/api/quizzes/:id', async (req, res) => {
     const { role } = req.query;
     try {
         const { rows: qRows } = await db.query('SELECT * FROM quizzes WHERE id = $1', [req.params.id]);
         if (!qRows.length) return res.status(404).json({ error: 'Not found' });
         const quiz = qRows[0];
-        const { rows: questions } = await db.query(
-            `SELECT id, quiz_id, type, question_text, options, video_url, order_index, points
+        const { rows: all } = await db.query(
+            `SELECT id, quiz_id, type, question_text, options, video_url, order_index, points, parent_question_id
              ${role === 'teacher' ? ', correct_answers' : ''}
              FROM quiz_questions WHERE quiz_id = $1 ORDER BY order_index ASC`,
             [req.params.id]
         );
+        const topLevel = all.filter(q => !q.parent_question_id);
+        const childrenByParent = {};
+        all.filter(q => q.parent_question_id).forEach(q => {
+            if (!childrenByParent[q.parent_question_id]) childrenByParent[q.parent_question_id] = [];
+            childrenByParent[q.parent_question_id].push(q);
+        });
+        const questions = topLevel.map(q => ({
+            ...q,
+            children: childrenByParent[q.id] || [],
+        }));
         res.json({ ...quiz, questions });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1974,19 +1989,21 @@ app.delete('/api/quizzes/:id', async (req, res) => {
 
 // Add question to quiz
 app.post('/api/quizzes/:id/questions', async (req, res) => {
-    const { type, questionText, options, correctAnswers, videoUrl, orderIndex, points } = req.body;
+    const { type, questionText, options, correctAnswers, videoUrl, orderIndex, points, parentQuestionId } = req.body;
     if (!type || !questionText) return res.status(400).json({ error: 'type and questionText required' });
     try {
+        const baseWhere = parentQuestionId ? 'parent_question_id = $1' : 'parent_question_id IS NULL AND quiz_id = $1';
+        const baseParams = parentQuestionId ? [parentQuestionId] : [req.params.id];
         const { rows: existing } = await db.query(
-            'SELECT COALESCE(MAX(order_index), -1) + 1 AS next_index FROM quiz_questions WHERE quiz_id = $1',
-            [req.params.id]
+            `SELECT COALESCE(MAX(order_index), -1) + 1 AS next_index FROM quiz_questions WHERE ${baseWhere}`,
+            baseParams
         );
         const idx = orderIndex ?? existing[0].next_index;
         const { rows } = await db.query(
-            `INSERT INTO quiz_questions (quiz_id, type, question_text, options, correct_answers, video_url, order_index, points)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            `INSERT INTO quiz_questions (quiz_id, type, question_text, options, correct_answers, video_url, order_index, points, parent_question_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
             [req.params.id, type, questionText.trim(), options ? JSON.stringify(options) : null,
-             correctAnswers ? JSON.stringify(correctAnswers) : null, videoUrl || null, idx, points || 1]
+             correctAnswers ? JSON.stringify(correctAnswers) : null, videoUrl || null, idx, points || 1, parentQuestionId || null]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2143,7 +2160,7 @@ app.get('/api/quizzes/:id/submissions', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Grade an answer (teacher) — also recalculates total submission score
+// Grade an answer (teacher) — also recalculates total submission score, emits to student
 app.patch('/api/quiz-answers/:id/grade', async (req, res) => {
     const { grade, feedback } = req.body;
     try {
@@ -2162,12 +2179,49 @@ app.patch('/api/quiz-answers/:id/grade', async (req, res) => {
         const allPts    = gradeData.reduce((s, r) => s + (Number(r.points) || 0), 0);
         const earnedPts = gradeData.reduce((s, r) => s + (r.teacher_grade !== null ? Number(r.teacher_grade) : 0), 0);
         const newScore  = allPts > 0 ? Math.round((earnedPts / allPts) * 100) : null;
-        await db.query(
+        const { rows: subRows } = await db.query(
             `UPDATE quiz_submissions SET score = $1
-             WHERE id = (SELECT submission_id FROM quiz_answers WHERE id = $2)`,
+             WHERE id = (SELECT submission_id FROM quiz_answers WHERE id = $2)
+             RETURNING id, quiz_id, student_id, teacher_final_score_override`,
             [newScore, req.params.id]
         );
+        const sub = subRows[0];
+        if (sub) {
+            const effectiveScore = sub.teacher_final_score_override != null ? Number(sub.teacher_final_score_override) : newScore;
+            const socketId = userSockets.get(sub.student_id);
+            if (socketId) io.to(socketId).emit('quiz:score-updated', { submissionId: sub.id, quizId: sub.quiz_id, studentId: sub.student_id, score: effectiveScore });
+        }
         res.json({ success: true, newScore });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Update submission overall feedback and optional final score override
+app.patch('/api/submissions/:id/feedback', async (req, res) => {
+    const { teacherOverallFeedback, teacherFinalScoreOverride } = req.body;
+    try {
+        const updates = [];
+        const params = [];
+        let i = 1;
+        if (teacherOverallFeedback !== undefined) {
+            updates.push(`teacher_overall_feedback = $${i++}`);
+            params.push(teacherOverallFeedback);
+        }
+        if (teacherFinalScoreOverride !== undefined) {
+            updates.push(`teacher_final_score_override = $${i++}`);
+            params.push(teacherFinalScoreOverride);
+        }
+        if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+        params.push(req.params.id);
+        const { rows } = await db.query(
+            `UPDATE quiz_submissions SET ${updates.join(', ')} WHERE id = $${i} RETURNING id, quiz_id, student_id, score, teacher_final_score_override, teacher_overall_feedback`,
+            params
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Not found' });
+        const sub = rows[0];
+        const effectiveScore = sub.teacher_final_score_override != null ? Number(sub.teacher_final_score_override) : sub.score;
+        const socketId = userSockets.get(sub.student_id);
+        if (socketId) io.to(socketId).emit('quiz:score-updated', { submissionId: sub.id, quizId: sub.quiz_id, studentId: sub.student_id, score: effectiveScore });
+        res.json({ success: true, teacherOverallFeedback: sub.teacher_overall_feedback, teacherFinalScoreOverride: sub.teacher_final_score_override });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2660,6 +2714,29 @@ server.listen(PORT, async () => {
         console.log('[migrate] quizzes.course_id ready');
     } catch (err) {
         console.warn('[migrate] quizzes.course_id:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE quiz_questions ADD COLUMN IF NOT EXISTS parent_question_id UUID REFERENCES quiz_questions(id) ON DELETE CASCADE`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_quiz_questions_parent ON quiz_questions(parent_question_id)`);
+        console.log('[migrate] quiz_questions.parent_question_id ready');
+    } catch (err) {
+        console.warn('[migrate] quiz_questions.parent_question_id:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS teacher_overall_feedback TEXT`);
+        await db.query(`ALTER TABLE quiz_submissions ADD COLUMN IF NOT EXISTS teacher_final_score_override NUMERIC`);
+        console.log('[migrate] quiz_submissions teacher_overall_feedback, teacher_final_score_override ready');
+    } catch (err) {
+        console.warn('[migrate] quiz_submissions feedback:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE lessons ADD COLUMN IF NOT EXISTS lesson_type TEXT DEFAULT 'text'`);
+        await db.query(`ALTER TABLE lessons ADD COLUMN IF NOT EXISTS video_url TEXT`);
+        await db.query(`ALTER TABLE lessons ADD COLUMN IF NOT EXISTS audio_url TEXT`);
+        await db.query(`UPDATE lessons SET lesson_type = 'text' WHERE lesson_type IS NULL`);
+        console.log('[migrate] lessons lesson_type, video_url, audio_url ready');
+    } catch (err) {
+        console.warn('[migrate] lessons type:', err.message);
     }
     console.log(`🚀 ClassMeet server running on port ${PORT}`);
     console.log(`   InsForge: ${process.env.INSFORGE_BASE_URL}`);
