@@ -168,10 +168,20 @@ async function setupDatabase() {
         `CREATE TABLE IF NOT EXISTS courses (
             id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             title       TEXT NOT NULL,
+            description TEXT,
             created_by  UUID NOT NULL,
             created_at  TIMESTAMPTZ DEFAULT NOW()
         )`,
-        `CREATE INDEX IF NOT EXISTS idx_courses_created_by ON courses(created_by)`
+        `CREATE INDEX IF NOT EXISTS idx_courses_created_by ON courses(created_by)`,
+        `CREATE TABLE IF NOT EXISTS lessons (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            course_id   UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+            title       TEXT NOT NULL,
+            content     TEXT,
+            order_index INT NOT NULL DEFAULT 0,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_lessons_course_id ON lessons(course_id)`
     ];
 
     for (const sql of statements) {

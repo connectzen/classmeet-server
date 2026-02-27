@@ -472,16 +472,54 @@ app.post('/api/invite-links', async (req, res) => {
         } else {
             return res.status(403).json({ error: 'Only Members and Teachers can create invite links' });
         }
+        // Create-or-return: reuse existing unused link if one exists
+        const { rows: existing } = await db.query(
+            'SELECT id, token FROM invite_links WHERE created_by = $1 AND role = $2 AND used_by IS NULL LIMIT 1',
+            [createdBy, allowedRole]
+        );
+        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        const base = baseUrl.replace(/\/$/, '');
+        if (existing.length > 0) {
+            const url = `${base}?invite=${existing[0].token}`;
+            return res.json({ url, token: existing[0].token });
+        }
         const token = crypto.randomBytes(24).toString('hex');
         await db.query(
             'INSERT INTO invite_links (token, role, created_by) VALUES ($1, $2, $3)',
             [token, allowedRole, createdBy]
         );
-        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-        const url = `${baseUrl.replace(/\/$/, '')}?invite=${token}`;
+        const url = `${base}?invite=${token}`;
         res.json({ url, token });
     } catch (err) {
         console.error('[invite-links]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/api/invite-links/regenerate', async (req, res) => {
+    const { createdBy, role } = req.body;
+    if (!createdBy || !role) return res.status(400).json({ error: 'createdBy and role are required' });
+    const allowedRole = role === 'student' || role === 'teacher' ? role : null;
+    if (!allowedRole) return res.status(400).json({ error: 'role must be student or teacher' });
+    try {
+        const creatorRole = await getRoleForUser(createdBy);
+        if (creatorRole === 'member') { /* ok */ } else if (creatorRole === 'teacher') {
+            if (allowedRole !== 'student') return res.status(403).json({ error: 'Teachers can only regenerate student invite links' });
+        } else {
+            return res.status(403).json({ error: 'Only Members and Teachers can regenerate invite links' });
+        }
+        const { rows } = await db.query(
+            'SELECT id FROM invite_links WHERE created_by = $1 AND role = $2 AND used_by IS NULL ORDER BY created_at DESC LIMIT 1',
+            [createdBy, allowedRole]
+        );
+        if (rows.length === 0) return res.status(404).json({ error: 'No unused invite link to regenerate' });
+        const newToken = crypto.randomBytes(24).toString('hex');
+        await db.query('UPDATE invite_links SET token = $1 WHERE id = $2 AND used_by IS NULL', [newToken, rows[0].id]);
+        const baseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        const url = `${baseUrl.replace(/\/$/, '')}?invite=${newToken}`;
+        res.json({ url, token: newToken });
+    } catch (err) {
+        console.error('[invite-links regenerate]', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1695,7 +1733,7 @@ app.post('/api/quiz/upload', upload.single('file'), async (req, res) => {
 // Create quiz
 // ── Courses CRUD (Member, Teacher, Admin) ──────────────────────────────────
 app.post('/api/courses', async (req, res) => {
-    const { title, createdBy } = req.body;
+    const { title, description, createdBy } = req.body;
     if (!title || !createdBy) return res.status(400).json({ error: 'title and createdBy required' });
     try {
         const creatorRole = await getRoleForUser(createdBy);
@@ -1703,8 +1741,8 @@ app.post('/api/courses', async (req, res) => {
             return res.status(403).json({ error: 'Only members, teachers, and admins can create courses' });
         }
         const { rows } = await db.query(
-            'INSERT INTO courses (title, created_by) VALUES ($1, $2) RETURNING *',
-            [title.trim(), createdBy]
+            'INSERT INTO courses (title, description, created_by) VALUES ($1, $2, $3) RETURNING *',
+            [title.trim(), description || null, createdBy]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1723,12 +1761,20 @@ app.get('/api/courses', async (req, res) => {
 });
 
 app.patch('/api/courses/:id', async (req, res) => {
-    const { title } = req.body;
+    const { title, description } = req.body;
     try {
-        const { rows } = await db.query(
-            'UPDATE courses SET title = COALESCE($1, title) WHERE id = $2 RETURNING *',
-            [title || null, req.params.id]
-        );
+        let rows;
+        if (description !== undefined) {
+            rows = (await db.query(
+                'UPDATE courses SET title = COALESCE($1, title), description = $2 WHERE id = $3 RETURNING *',
+                [title || null, description, req.params.id]
+            )).rows;
+        } else {
+            rows = (await db.query(
+                'UPDATE courses SET title = COALESCE($1, title) WHERE id = $2 RETURNING *',
+                [title || null, req.params.id]
+            )).rows;
+        }
         if (!rows.length) return res.status(404).json({ error: 'Not found' });
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1737,6 +1783,56 @@ app.patch('/api/courses/:id', async (req, res) => {
 app.delete('/api/courses/:id', async (req, res) => {
     try {
         await db.query('DELETE FROM courses WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/courses/:id/lessons', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            'SELECT * FROM lessons WHERE course_id = $1 ORDER BY order_index ASC, created_at ASC',
+            [req.params.id]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/courses/:id/lessons', async (req, res) => {
+    const { title, content, orderIndex } = req.body;
+    if (!title) return res.status(400).json({ error: 'title required' });
+    try {
+        const order = orderIndex != null ? orderIndex : 0;
+        const { rows } = await db.query(
+            'INSERT INTO lessons (course_id, title, content, order_index) VALUES ($1, $2, $3, $4) RETURNING *',
+            [req.params.id, title.trim(), content || null, order]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/lessons/:id', async (req, res) => {
+    const { title, content, orderIndex } = req.body;
+    try {
+        const updates = [];
+        const params = [];
+        let i = 1;
+        if (title !== undefined) { updates.push(`title = $${i++}`); params.push(title); }
+        if (content !== undefined) { updates.push(`content = $${i++}`); params.push(content); }
+        if (orderIndex !== undefined) { updates.push(`order_index = $${i++}`); params.push(orderIndex); }
+        if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        params.push(req.params.id);
+        const { rows } = await db.query(
+            `UPDATE lessons SET ${updates.join(', ')} WHERE id = $${i} RETURNING *`,
+            params
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/lessons/:id', async (req, res) => {
+    try {
+        await db.query('DELETE FROM lessons WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2536,6 +2632,28 @@ server.listen(PORT, async () => {
         console.log('[migrate] user_onboarding, invite_links, guest_rooms, courses ready');
     } catch (err) {
         console.warn('[migrate] role system tables:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT`);
+        console.log('[migrate] courses.description ready');
+    } catch (err) {
+        console.warn('[migrate] courses.description:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS lessons (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                course_id   UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                title       TEXT NOT NULL,
+                content     TEXT,
+                order_index INT NOT NULL DEFAULT 0,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_lessons_course_id ON lessons(course_id)`);
+        console.log('[migrate] lessons table ready');
+    } catch (err) {
+        console.warn('[migrate] lessons:', err.message);
     }
     try {
         await db.query(`ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS course_id UUID`);
