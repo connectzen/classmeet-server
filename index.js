@@ -2543,7 +2543,7 @@ app.get('/api/groups/:id/members', async (req, res) => {
         const { rows } = await db.query(
             `SELECT sgm.student_id AS id, ur.name, ur.email, ur.avatar_url
              FROM student_group_members sgm
-             LEFT JOIN user_roles ur ON ur.user_id = sgm.student_id
+             LEFT JOIN user_roles ur ON ur.user_id::text = sgm.student_id
              WHERE sgm.group_id = $1
              ORDER BY ur.name`,
             [req.params.id]
@@ -2567,7 +2567,7 @@ app.post('/api/groups/:id/members', async (req, res) => {
         const { rows } = await db.query(
             `SELECT sgm.student_id AS id, ur.name, ur.email, ur.avatar_url
              FROM student_group_members sgm
-             LEFT JOIN user_roles ur ON ur.user_id = sgm.student_id
+             LEFT JOIN user_roles ur ON ur.user_id::text = sgm.student_id
              WHERE sgm.group_id = $1 ORDER BY ur.name`,
             [id]
         );
