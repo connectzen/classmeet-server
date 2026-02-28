@@ -2757,6 +2757,25 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ── Camera toggle for a participant (teacher only) ─────────────────────
+    socket.on('cam-participant', ({ targetSocketId, camOn }) => {
+        io.to(targetSocketId).emit('force-cam', { camOn, byTeacher: true });
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (info) {
+            const roomCode = roomManager.getParticipantRoom(socket.id);
+            socket.to(roomCode).emit('participant-cam-changed', { socketId: targetSocketId, camOn });
+        }
+    });
+
+    // ── Participant broadcasts own camera state (any participant) ───────────
+    socket.on('self-cam-changed', ({ camOn }) => {
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (info) {
+            const roomCode = roomManager.getParticipantRoom(socket.id);
+            socket.to(roomCode).emit('participant-cam-changed', { socketId: socket.id, camOn });
+        }
+    });
+
     // ── Spotlight Change (teacher → broadcast to all) ───────────────────────
     socket.on('spotlight-change', ({ roomCode, spotlightSocketId }) => {
         roomManager.setSpotlight(roomCode, spotlightSocketId);
