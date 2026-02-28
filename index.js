@@ -83,6 +83,149 @@ async function cascadeDeleteUserContent(userId) {
     }
 }
 
+// ── Cascade cleanup when teacher/member is downgraded to student ──────────
+// Transfers their students to the new assigner, deletes their content (courses, quizzes, sessions, invite links)
+async function cascadeRoleDowngrade(userId, newAssignedBy, previousRole) {
+    const baseUrl = process.env.INSFORGE_BASE_URL;
+    const apiKey  = process.env.INSFORGE_API_KEY;
+
+    console.log(`[cascadeRoleDowngrade] User ${userId} downgraded from ${previousRole} to student`);
+
+    // 1. Transfer students assigned to this user to the new assigner
+    const { rowCount: transferredStudents } = await db.query(
+        'UPDATE user_roles SET assigned_by = $1 WHERE assigned_by = $2',
+        [newAssignedBy, userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Transferred ${transferredStudents} students to new assigner ${newAssignedBy}`);
+
+    // 2. Collect all storage URLs to delete
+    const urlsToDelete = [];
+
+    // 2a. Session images from teacher_sessions (stored in 'avatars' bucket)
+    const { rows: sessions } = await db.query(
+        'SELECT session_image_url FROM teacher_sessions WHERE created_by = $1 AND session_image_url IS NOT NULL',
+        [userId]
+    );
+    for (const s of sessions) {
+        const parts = (s.session_image_url || '').split('/api/storage/buckets/avatars/objects/');
+        if (parts[1]) urlsToDelete.push({ bucket: 'avatars', key: parts[1] });
+    }
+
+    // 2b. Quiz question videos and quiz answer files (stored in 'chat-media' bucket)
+    const { rows: quizMedia } = await db.query(
+        `SELECT qq.video_url, qa.file_url
+         FROM quizzes q
+         LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id
+         LEFT JOIN quiz_submissions qs ON qs.quiz_id = q.id
+         LEFT JOIN quiz_answers qa ON qa.submission_id = qs.id
+         WHERE q.created_by = $1 AND (qq.video_url IS NOT NULL OR qa.file_url IS NOT NULL)`,
+        [userId]
+    );
+    for (const row of quizMedia) {
+        if (row.video_url) {
+            const parts = row.video_url.split('/api/storage/buckets/chat-media/objects/');
+            if (parts[1]) urlsToDelete.push({ bucket: 'chat-media', key: parts[1] });
+        }
+        if (row.file_url) {
+            const parts = row.file_url.split('/api/storage/buckets/chat-media/objects/');
+            if (parts[1]) urlsToDelete.push({ bucket: 'chat-media', key: parts[1] });
+        }
+    }
+
+    // 2c. Lesson videos and audio from courses (stored in 'chat-media' bucket)
+    const { rows: lessonMedia } = await db.query(
+        `SELECT l.video_url, l.audio_url
+         FROM courses c
+         JOIN lessons l ON l.course_id = c.id
+         WHERE c.created_by = $1 AND (l.video_url IS NOT NULL OR l.audio_url IS NOT NULL)`,
+        [userId]
+    );
+    for (const row of lessonMedia) {
+        if (row.video_url) {
+            const parts = row.video_url.split('/api/storage/buckets/chat-media/objects/');
+            if (parts[1]) urlsToDelete.push({ bucket: 'chat-media', key: parts[1] });
+        }
+        if (row.audio_url) {
+            const parts = row.audio_url.split('/api/storage/buckets/chat-media/objects/');
+            if (parts[1]) urlsToDelete.push({ bucket: 'chat-media', key: parts[1] });
+        }
+    }
+
+    // 3. Delete storage files
+    for (const { bucket, key } of urlsToDelete) {
+        if (baseUrl && apiKey) {
+            try {
+                await fetch(`${baseUrl}/api/storage/buckets/${bucket}/objects/${key}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${apiKey}` },
+                });
+            } catch (e) { console.warn(`[cascadeRoleDowngrade] Storage delete failed for ${bucket}/${key}:`, e.message); }
+        }
+    }
+    console.log(`[cascadeRoleDowngrade] Deleted ${urlsToDelete.length} storage files`);
+
+    // 4. Get room IDs from teacher_sessions before deleting (for enrollment cleanup)
+    const { rows: sessionRooms } = await db.query(
+        'SELECT room_id FROM teacher_sessions WHERE created_by = $1',
+        [userId]
+    );
+    const roomIds = sessionRooms.map(r => r.room_id);
+
+    // 5. Delete teacher_sessions (cascades to teacher_session_targets)
+    const { rowCount: deletedSessions } = await db.query(
+        'DELETE FROM teacher_sessions WHERE created_by = $1',
+        [userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Deleted ${deletedSessions} teacher sessions`);
+
+    // 6. Delete student enrollments for those rooms
+    if (roomIds.length > 0) {
+        const { rowCount: deletedEnrollments } = await db.query(
+            'DELETE FROM student_enrollments WHERE room_id = ANY($1)',
+            [roomIds]
+        );
+        console.log(`[cascadeRoleDowngrade] Deleted ${deletedEnrollments} student enrollments`);
+    }
+
+    // 7. Delete courses (cascades to lessons)
+    const { rowCount: deletedCourses } = await db.query(
+        'DELETE FROM courses WHERE created_by = $1',
+        [userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Deleted ${deletedCourses} courses`);
+
+    // 8. Delete quizzes (cascades to quiz_questions, quiz_submissions, quiz_answers)
+    const { rowCount: deletedQuizzes } = await db.query(
+        'DELETE FROM quizzes WHERE created_by = $1',
+        [userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Deleted ${deletedQuizzes} quizzes`);
+
+    // 9. Delete invite_links created by this user (cascades to invite_link_claims)
+    const { rowCount: deletedInvites } = await db.query(
+        'DELETE FROM invite_links WHERE created_by = $1',
+        [userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Deleted ${deletedInvites} invite links`);
+
+    // 10. Delete guest_rooms created by this user
+    const { rowCount: deletedGuestRooms } = await db.query(
+        'DELETE FROM guest_rooms WHERE host_id = $1',
+        [userId]
+    );
+    console.log(`[cascadeRoleDowngrade] Deleted ${deletedGuestRooms} guest rooms`);
+
+    return {
+        transferredStudents,
+        deletedSessions,
+        deletedCourses,
+        deletedQuizzes,
+        deletedInvites,
+        deletedGuestRooms,
+        deletedStorageFiles: urlsToDelete.length,
+    };
+}
+
 // ─── REST ────────────────────────────────────────────────────────────────
 
 // Admin user IDs from env (comma-separated)
@@ -549,19 +692,36 @@ app.post('/api/claim-invite', async (req, res) => {
             [token]
         );
         if (rows.length === 0) return res.status(404).json({ error: 'Invalid invite link' });
-        const { id: inviteLinkId, role, created_by: assignedBy } = rows[0];
+        const { id: inviteLinkId, role: newRole, created_by: assignedBy } = rows[0];
+
+        // Check user's current role before updating (for downgrade detection)
+        const { rows: currentRoleRows } = await db.query(
+            'SELECT role FROM user_roles WHERE user_id = $1',
+            [userId]
+        );
+        const previousRole = currentRoleRows.length > 0 ? currentRoleRows[0].role : null;
+
         await db.query(
             `INSERT INTO user_roles (user_id, role, name, email, assigned_by) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role, name = EXCLUDED.name, email = EXCLUDED.email, assigned_by = EXCLUDED.assigned_by`,
-            [userId, role, name || '', email || '', assignedBy]
+            [userId, newRole, name || '', email || '', assignedBy]
         );
         await db.query(
             'INSERT INTO invite_link_claims (invite_link_id, user_id) VALUES ($1, $2) ON CONFLICT (invite_link_id, user_id) DO NOTHING',
             [inviteLinkId, userId]
         );
+
+        // If user was downgraded from teacher/member to student, cascade cleanup
+        const isDowngrade = (previousRole === 'teacher' || previousRole === 'member') && newRole === 'student';
+        if (isDowngrade) {
+            console.log(`[claim-invite] Role downgrade detected: ${previousRole} → ${newRole} for user ${userId}`);
+            const cleanupResult = await cascadeRoleDowngrade(userId, assignedBy, previousRole);
+            console.log('[claim-invite] Cleanup result:', cleanupResult);
+        }
+
         io.emit('admin:refresh', { type: 'pending' });
         io.emit('dashboard:data-changed');
-        res.json({ success: true, role });
+        res.json({ success: true, role: newRole });
     } catch (err) {
         console.error('[claim-invite]', err.message);
         res.status(500).json({ error: err.message });
