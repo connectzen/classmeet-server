@@ -1290,7 +1290,7 @@ app.get('/api/chat/conversations/:userId', async (req, res) => {
                 const { rows: others } = await db.query(
                     `SELECT cp.user_id, COALESCE(ur.name, cp.user_name) AS user_name, COALESCE(ur.role, cp.user_role) AS user_role, ur.avatar_url
                      FROM chat_participants cp
-                     LEFT JOIN user_roles ur ON ur.user_id = cp.user_id
+                     LEFT JOIN user_roles ur ON ur.user_id::text = cp.user_id
                      WHERE cp.conversation_id = $1 AND cp.user_id != $2 LIMIT 1`,
                     [conv.conversation_id, userId]
                 );
