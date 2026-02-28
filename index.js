@@ -1339,17 +1339,27 @@ app.post('/api/chat/conversations/dm', async (req, res) => {
         );
         if (existing.length > 0) return res.json({ id: existing[0].conversation_id });
 
-        // Create new DM
-        const { rows: newConv } = await db.query(
-            `INSERT INTO chat_conversations (type) VALUES ('dm') RETURNING id`
-        );
-        const convId = newConv[0].id;
-        await db.query(
-            `INSERT INTO chat_participants (conversation_id, user_id, user_name, user_role) VALUES
-             ($1,$2,$3,$4),($1,$5,$6,$7)`,
-            [convId, userId, userName || '', userRole || '', otherId, otherName || '', otherRole || '']
-        );
-        res.json({ id: convId });
+        // Create new DM (transaction ensures both inserts succeed or neither does)
+        const client = await db.getClient();
+        try {
+            await client.query('BEGIN');
+            const { rows: newConv } = await client.query(
+                `INSERT INTO chat_conversations (type) VALUES ('dm') RETURNING id`
+            );
+            const convId = newConv[0].id;
+            await client.query(
+                `INSERT INTO chat_participants (conversation_id, user_id, user_name, user_role) VALUES
+                 ($1,$2,$3,$4),($1,$5,$6,$7)`,
+                [convId, userId, userName || '', userRole || '', otherId, otherName || '', otherRole || '']
+            );
+            await client.query('COMMIT');
+            client.release();
+            res.json({ id: convId });
+        } catch (txErr) {
+            await client.query('ROLLBACK').catch(() => {});
+            client.release();
+            throw txErr;
+        }
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
