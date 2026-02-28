@@ -2025,19 +2025,27 @@ app.delete('/api/lessons/:id', async (req, res) => {
 });
 
 app.post('/api/quizzes', async (req, res) => {
-    const { title, roomId, courseId, timeLimitMinutes, createdBy } = req.body;
+    const { title, roomId, courseId, timeLimitMinutes, createdBy, targetGroupIds, targetStudentIds } = req.body;
     if (!title || !createdBy) return res.status(400).json({ error: 'title and createdBy required' });
-    if (!roomId && !courseId) return res.status(400).json({ error: 'Select at least a room or course' });
-    const room = roomId || (courseId ? `course-only-${courseId}` : 'placeholder');
+    const hasRoom = !!roomId;
+    const hasCourse = !!courseId;
+    const hasGroups = Array.isArray(targetGroupIds) && targetGroupIds.length > 0;
+    const hasStudents = Array.isArray(targetStudentIds) && targetStudentIds.length > 0;
+    if (!hasRoom && !hasCourse && !hasGroups && !hasStudents) {
+        return res.status(400).json({ error: 'Select at least a room, course, group(s), or student(s)' });
+    }
+    const room = roomId || (courseId ? `course-only-${courseId}` : (hasGroups || hasStudents ? 'group-targeted' : 'placeholder'));
+    const groupIds = hasGroups ? targetGroupIds : [];
+    const studentIds = hasStudents ? targetStudentIds : [];
     try {
         const creatorRole = await getRoleForUser(createdBy);
         if (creatorRole !== 'member' && creatorRole !== 'teacher' && creatorRole !== 'admin') {
             return res.status(403).json({ error: 'Only members, teachers, and admins can create quizzes' });
         }
         const { rows } = await db.query(
-            `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes, course_id)
-             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [title.trim(), room, createdBy, timeLimitMinutes || null, courseId || null]
+            `INSERT INTO quizzes (title, room_id, created_by, time_limit_minutes, course_id, target_group_ids, target_student_ids)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [title.trim(), room, createdBy, timeLimitMinutes || null, courseId || null, groupIds, studentIds]
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2061,8 +2069,9 @@ app.get('/api/quizzes', async (req, res) => {
             return res.json(rows);
         }
 
-        // Student path: collect room IDs from both enrollments AND session targets
-        let ids = [];
+        // Student path: collect room IDs from enrollments, session targets, AND group/individual targeting
+        const { roomIds: roomIdsParam } = req.query;
+        let roomIds = [];
         if (studentId) {
             const { rows: enRows } = await db.query(
                 `SELECT room_id FROM student_enrollments WHERE user_id = $1`, [studentId]
@@ -2077,31 +2086,63 @@ app.get('/api/quizzes', async (req, res) => {
                 ...enRows.map(r => r.room_id),
                 ...tgtRows.map(r => r.room_id),
             ].filter(Boolean));
-            ids = [...all];
-        } else if (roomIds) {
-            ids = String(roomIds).split(',').filter(Boolean);
+            roomIds = [...all];
+        } else if (roomIdsParam) {
+            roomIds = String(roomIdsParam).split(',').filter(Boolean);
         }
 
-        if (!ids.length) return res.json([]);
-        const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
-        const params = [...ids];
-        // Include this student's submission status when studentId is known
-        let subJoin = '', subSelect = '', subGroup = '';
-        if (studentId) {
-            params.push(String(studentId));
-            const sp = params.length;
-            subJoin   = `LEFT JOIN quiz_submissions sub ON sub.quiz_id = q.id AND sub.student_id = $${sp}`;
-            subSelect = `, sub.submitted_at AS submitted_at, COALESCE(sub.teacher_final_score_override, sub.score) AS my_score`;
-            subGroup  = `, sub.submitted_at, sub.score, sub.teacher_final_score_override`;
+        const sid = studentId ? String(studentId) : null;
+        const params = [...roomIds];
+        const placeholders = params.length ? params.map((_, i) => `$${i + 1}`).join(',') : 'NULL';
+        const roomClause = params.length ? `q.room_id IN (${placeholders})` : 'FALSE';
+
+        // Room-based quizzes
+        let roomQuizIds = [];
+        if (params.length) {
+            const { rows: rRows } = await db.query(
+                `SELECT q.id FROM quizzes q WHERE ${roomClause} AND q.status = 'published'`,
+                params
+            );
+            roomQuizIds = rRows.map(r => r.id);
         }
+
+        // Group/individual-targeted quizzes (only when studentId provided)
+        let groupQuizIds = [];
+        if (sid) {
+            const { rows: gRows } = await db.query(
+                `SELECT q.id FROM quizzes q
+                 WHERE q.status = 'published'
+                 AND (
+                   $1 = ANY(COALESCE(q.target_student_ids, '{}'))
+                   OR EXISTS (
+                     SELECT 1 FROM student_group_members sgm
+                     WHERE sgm.student_id = $1 AND sgm.group_id = ANY(COALESCE(q.target_group_ids, '{}'))
+                   )
+                 )`,
+                [sid]
+            );
+            groupQuizIds = gRows.map(r => r.id);
+        }
+
+        const allQuizIds = [...new Set([...roomQuizIds, ...groupQuizIds])];
+        if (!allQuizIds.length) return res.json([]);
+
+        const qPlaceholders = allQuizIds.map((_, i) => `$${i + 1}`).join(',');
+        const qParams = sid ? [...allQuizIds, sid] : allQuizIds;
+        const qSp = qParams.length;
+        const subJoin = sid
+            ? `LEFT JOIN quiz_submissions sub ON sub.quiz_id = q.id AND sub.student_id = $${qSp}`
+            : '';
+        const subSelect = sid ? `, sub.submitted_at AS submitted_at, COALESCE(sub.teacher_final_score_override, sub.score) AS my_score` : '';
+        const subGroup = sid ? `, sub.submitted_at, sub.score, sub.teacher_final_score_override` : '';
         const { rows } = await db.query(
             `SELECT q.*, COUNT(qq.id)::int AS question_count${subSelect}
              FROM quizzes q
              LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id
              ${subJoin}
-             WHERE q.room_id IN (${placeholders}) AND q.status = 'published'
+             WHERE q.id IN (${qPlaceholders})
              GROUP BY q.id${subGroup} ORDER BY q.created_at DESC`,
-            params
+            qParams
         );
         return res.json(rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2445,6 +2486,104 @@ app.get('/api/teacher/:teacherId/students', async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+});
+
+// ─── Student Groups ─────────────────────────────────────────────────────
+app.get('/api/teacher/:teacherId/groups', async (req, res) => {
+    const { teacherId } = req.params;
+    try {
+        const { rows } = await db.query(
+            `SELECT sg.id, sg.name, sg.created_at,
+                    (SELECT COUNT(*)::int FROM student_group_members WHERE group_id = sg.id) AS member_count
+             FROM student_groups sg
+             WHERE sg.teacher_id = $1
+             ORDER BY sg.name`,
+            [teacherId]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/teacher/:teacherId/groups', async (req, res) => {
+    const { teacherId } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+    try {
+        const { rows } = await db.query(
+            `INSERT INTO student_groups (teacher_id, name) VALUES ($1, $2) RETURNING *`,
+            [teacherId, name.trim()]
+        );
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/groups/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+    try {
+        const { rows } = await db.query(
+            `UPDATE student_groups SET name = $1 WHERE id = $2 RETURNING *`,
+            [name.trim(), id]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Group not found' });
+        res.json(rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/groups/:id', async (req, res) => {
+    try {
+        await db.query('DELETE FROM student_groups WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/groups/:id/members', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT sgm.student_id AS id, ur.name, ur.email, ur.avatar_url
+             FROM student_group_members sgm
+             LEFT JOIN user_roles ur ON ur.user_id = sgm.student_id
+             WHERE sgm.group_id = $1
+             ORDER BY ur.name`,
+            [req.params.id]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/groups/:id/members', async (req, res) => {
+    const { id } = req.params;
+    const { studentIds } = req.body;
+    if (!Array.isArray(studentIds) || studentIds.length === 0) return res.status(400).json({ error: 'studentIds array required' });
+    try {
+        for (const sid of studentIds) {
+            await db.query(
+                `INSERT INTO student_group_members (group_id, student_id) VALUES ($1, $2)
+                 ON CONFLICT (group_id, student_id) DO NOTHING`,
+                [id, sid]
+            );
+        }
+        const { rows } = await db.query(
+            `SELECT sgm.student_id AS id, ur.name, ur.email, ur.avatar_url
+             FROM student_group_members sgm
+             LEFT JOIN user_roles ur ON ur.user_id = sgm.student_id
+             WHERE sgm.group_id = $1 ORDER BY ur.name`,
+            [id]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/groups/:id/members/:studentId', async (req, res) => {
+    const { id, studentId } = req.params;
+    try {
+        await db.query(
+            'DELETE FROM student_group_members WHERE group_id = $1 AND student_id = $2',
+            [id, studentId]
+        );
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────
@@ -3061,6 +3200,37 @@ server.listen(PORT, async () => {
         console.log('[migrate] lessons lesson_type, video_url, audio_url ready');
     } catch (err) {
         console.warn('[migrate] lessons type:', err.message);
+    }
+    try {
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS student_groups (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                teacher_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_student_groups_teacher_id ON student_groups(teacher_id)`);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS student_group_members (
+                id SERIAL PRIMARY KEY,
+                group_id UUID NOT NULL REFERENCES student_groups(id) ON DELETE CASCADE,
+                student_id TEXT NOT NULL,
+                UNIQUE(group_id, student_id)
+            )
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_student_group_members_group_id ON student_group_members(group_id)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_student_group_members_student_id ON student_group_members(student_id)`);
+        console.log('[migrate] student_groups + student_group_members ready');
+    } catch (err) {
+        console.warn('[migrate] student_groups tables:', err.message);
+    }
+    try {
+        await db.query(`ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS target_group_ids UUID[] DEFAULT '{}'`);
+        await db.query(`ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS target_student_ids TEXT[] DEFAULT '{}'`);
+        console.log('[migrate] quizzes target_group_ids, target_student_ids ready');
+    } catch (err) {
+        console.warn('[migrate] quizzes target columns:', err.message);
     }
     try {
         await db.query('DROP TABLE IF EXISTS rejected_users');
