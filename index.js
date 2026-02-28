@@ -2175,13 +2175,45 @@ app.get('/api/quizzes/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Update quiz (title, timeLimitMinutes)
+// Update quiz (title, timeLimitMinutes, roomId, courseId, targetGroupIds, targetStudentIds)
 app.patch('/api/quizzes/:id', async (req, res) => {
-    const { title, timeLimitMinutes } = req.body;
+    const { title, timeLimitMinutes, roomId, courseId, targetGroupIds, targetStudentIds } = req.body;
     try {
+        const { rows: existing } = await db.query('SELECT * FROM quizzes WHERE id = $1', [req.params.id]);
+        if (!existing.length) return res.status(404).json({ error: 'Quiz not found' });
+        const quiz = existing[0];
+
+        const updates = [];
+        const params = [];
+        let i = 1;
+
+        if (title !== undefined) { updates.push(`title = $${i++}`); params.push(title.trim()); }
+        if (timeLimitMinutes !== undefined) { updates.push(`time_limit_minutes = $${i++}`); params.push(timeLimitMinutes ? Number(timeLimitMinutes) : null); }
+        if (courseId !== undefined) { updates.push(`course_id = $${i++}`); params.push(courseId || null); }
+
+        if (roomId !== undefined || targetGroupIds !== undefined || targetStudentIds !== undefined) {
+            const rid = roomId !== undefined ? roomId : quiz.room_id;
+            const cid = courseId !== undefined ? courseId : quiz.course_id;
+            const gids = targetGroupIds !== undefined ? (Array.isArray(targetGroupIds) ? targetGroupIds : []) : (quiz.target_group_ids || []);
+            const sids = targetStudentIds !== undefined ? (Array.isArray(targetStudentIds) ? targetStudentIds : []) : (quiz.target_student_ids || []);
+            const hasRoom = !!rid && rid !== 'group-targeted' && !String(rid).startsWith('course-only-');
+            const hasCourse = !!cid;
+            const hasGroups = gids.length > 0;
+            const hasStudents = sids.length > 0;
+            if (!hasRoom && !hasCourse && !hasGroups && !hasStudents) {
+                return res.status(400).json({ error: 'Select at least a room, course, group(s), or student(s)' });
+            }
+            const room = rid || (hasCourse ? `course-only-${cid}` : (hasGroups || hasStudents ? 'group-targeted' : quiz.room_id));
+            updates.push(`room_id = $${i++}`); params.push(room);
+            updates.push(`target_group_ids = $${i++}`); params.push(gids);
+            updates.push(`target_student_ids = $${i++}`); params.push(sids);
+        }
+
+        if (updates.length === 0) return res.json(quiz);
+        params.push(req.params.id);
         const { rows } = await db.query(
-            `UPDATE quizzes SET title = COALESCE($1, title), time_limit_minutes = $2 WHERE id = $3 RETURNING *`,
-            [title || null, timeLimitMinutes ?? null, req.params.id]
+            `UPDATE quizzes SET ${updates.join(', ')} WHERE id = $${i} RETURNING *`,
+            params
         );
         res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
