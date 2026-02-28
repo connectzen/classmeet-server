@@ -2741,13 +2741,26 @@ io.on('connection', (socket) => {
     });
 
     // ── End Room (teacher intentional) ────────────────────────────────────
+    // Triggers countdown for everyone (including teacher) instead of immediate end
     socket.on('end-room', async ({ roomCode, roomId }) => {
+        const info = roomManager.getParticipantInfo(socket.id);
+        if (!info || info.role !== 'teacher') return;
         if (teacherGraceTimers.has(roomCode)) {
             clearTimeout(teacherGraceTimers.get(roomCode));
             teacherGraceTimers.delete(roomCode);
         }
         roomQuizState.delete(roomCode);
-        await endRoom(roomCode, roomId);
+        // Emit teacher-disconnected so all clients (including teacher) see countdown
+        console.log(`[Room ${roomCode}] Teacher ended class — ${TEACHER_GRACE_MS / 1000}s grace period started`);
+        io.to(roomCode).emit('teacher-disconnected', { graceSeconds: TEACHER_GRACE_MS / 1000 });
+        roomManager.removeParticipant(socket.id);
+        socket.to(roomCode).emit('participant-left', { socketId: socket.id });
+        const timer = setTimeout(async () => {
+            teacherGraceTimers.delete(roomCode);
+            console.log(`[Room ${roomCode}] Grace period expired — ending room`);
+            await endRoom(roomCode, roomId);
+        }, TEACHER_GRACE_MS);
+        teacherGraceTimers.set(roomCode, timer);
     });
 
     // ── Room Quiz (teacher starts/stops, students submit, teacher reveals) ──
